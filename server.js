@@ -22,22 +22,6 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("dev"));
 
-function isValidId(value) {
-  return Number.isInteger(Number(value)) && Number(value) > 0;
-}
-
-function toInt(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const n = Number.parseInt(value, 10);
-  return Number.isNaN(n) ? null : n;
-}
-
-function toNum(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const n = Number(value);
-  return Number.isNaN(n) ? null : n;
-}
-
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS players (
@@ -66,58 +50,10 @@ async function initDb() {
       session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
       packet_index INTEGER,
       packet_type TEXT NOT NULL,
-      lap_number INTEGER,
       game_time_ms INTEGER,
       payload JSONB NOT NULL,
       received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS telemetry_metrics (
-      id SERIAL PRIMARY KEY,
-      session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-      packet_id INTEGER REFERENCES telemetry_packets(id) ON DELETE SET NULL,
-      lap_number INTEGER,
-      metric_key TEXT NOT NULL,
-      metric_value_num DOUBLE PRECISION,
-      metric_value_text TEXT,
-      metric_value_bool BOOLEAN,
-      metric_value_json JSONB,
-      source TEXT,
-      recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS lap_records (
-      id SERIAL PRIMARY KEY,
-      session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-      lap_number INTEGER NOT NULL,
-      lap_time_ms INTEGER NOT NULL,
-      sector1_ms INTEGER,
-      sector2_ms INTEGER,
-      sector3_ms INTEGER,
-      valid BOOLEAN NOT NULL DEFAULT TRUE,
-      recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE(session_id, lap_number)
-    );
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_sessions_player_id ON sessions(player_id);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_packets_session_id ON telemetry_packets(session_id);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_metrics_session_id ON telemetry_metrics(session_id);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_laps_session_id ON lap_records(session_id);
   `);
 }
 
@@ -165,7 +101,7 @@ app.post("/sessions", async (req, res) => {
   try {
     const { playerId, track, car, gameVersion, notes } = req.body;
 
-    if (!isValidId(playerId)) {
+    if (!playerId) {
       return res.status(400).json({ error: "playerId is required" });
     }
 
@@ -191,8 +127,8 @@ app.post("/sessions", async (req, res) => {
 
 app.get("/sessions/:id", async (req, res) => {
   try {
-    const sessionId = toInt(req.params.id);
-    if (!sessionId) {
+    const sessionId = Number(req.params.id);
+    if (!Number.isInteger(sessionId) || sessionId <= 0) {
       return res.status(400).json({ error: "invalid session id" });
     }
 
@@ -208,92 +144,22 @@ app.get("/sessions/:id", async (req, res) => {
       return res.status(404).json({ error: "session not found" });
     }
 
-    const lapsResult = await pool.query(
-      `SELECT *
-       FROM lap_records
-       WHERE session_id = $1
-       ORDER BY lap_number ASC`,
-      [sessionId]
-    );
-
     const packetsResult = await pool.query(
       `SELECT *
        FROM telemetry_packets
        WHERE session_id = $1
        ORDER BY received_at ASC, id ASC
-       LIMIT 200`,
-      [sessionId]
-    );
-
-    const metricsResult = await pool.query(
-      `SELECT *
-       FROM telemetry_metrics
-       WHERE session_id = $1
-       ORDER BY recorded_at ASC, id ASC
        LIMIT 500`,
       [sessionId]
     );
 
     res.json({
       session: sessionResult.rows[0],
-      laps: lapsResult.rows,
-      packets: packetsResult.rows,
-      metrics: metricsResult.rows
+      packets: packetsResult.rows
     });
   } catch (err) {
     console.error("GET /sessions/:id error:", err);
     res.status(500).json({ error: "failed to fetch session" });
-  }
-});
-
-app.post("/laps", async (req, res) => {
-  try {
-    const {
-      sessionId,
-      lapNumber,
-      lapTimeMs,
-      sector1Ms,
-      sector2Ms,
-      sector3Ms,
-      valid = true
-    } = req.body;
-
-    if (!isValidId(sessionId) || !isValidId(lapNumber) || !isValidId(lapTimeMs)) {
-      return res.status(400).json({
-        error: "sessionId, lapNumber, and lapTimeMs are required"
-      });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO lap_records (
-         session_id, lap_number, lap_time_ms,
-         sector1_ms, sector2_ms, sector3_ms, valid
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (session_id, lap_number)
-       DO UPDATE SET
-         lap_time_ms = EXCLUDED.lap_time_ms,
-         sector1_ms = EXCLUDED.sector1_ms,
-         sector2_ms = EXCLUDED.sector2_ms,
-         sector3_ms = EXCLUDED.sector3_ms,
-         valid = EXCLUDED.valid,
-         recorded_at = NOW()
-       RETURNING *`,
-      [
-        Number(sessionId),
-        Number(lapNumber),
-        Number(lapTimeMs),
-        toInt(sector1Ms),
-        toInt(sector2Ms),
-        toInt(sector3Ms),
-        Boolean(valid)
-      ]
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    console.error("POST /laps error:", err);
-    res.status(500).json({ error: "failed to save lap" });
   }
 });
 
@@ -303,12 +169,11 @@ app.post("/telemetry/packet", async (req, res) => {
       sessionId,
       packetType,
       packetIndex,
-      lapNumber,
       gameTimeMs,
       payload
     } = req.body;
 
-    if (!isValidId(sessionId) || !packetType || payload === undefined) {
+    if (!sessionId || !packetType || payload === undefined) {
       return res.status(400).json({
         error: "sessionId, packetType, and payload are required"
       });
@@ -316,16 +181,15 @@ app.post("/telemetry/packet", async (req, res) => {
 
     const result = await pool.query(
       `INSERT INTO telemetry_packets (
-         session_id, packet_index, packet_type, lap_number, game_time_ms, payload
+         session_id, packet_index, packet_type, game_time_ms, payload
        )
-       VALUES ($1, $2, $3, $4, $5, $6)
+       VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
       [
         Number(sessionId),
-        toInt(packetIndex),
+        packetIndex ?? null,
         String(packetType),
-        toInt(lapNumber),
-        toInt(gameTimeMs),
+        gameTimeMs ?? null,
         JSON.stringify(payload)
       ]
     );
@@ -337,86 +201,10 @@ app.post("/telemetry/packet", async (req, res) => {
   }
 });
 
-app.post("/telemetry/metric", async (req, res) => {
-  try {
-    const {
-      sessionId,
-      packetId,
-      lapNumber,
-      metricKey,
-      metricValueNum,
-      metricValueText,
-      metricValueBool,
-      metricValueJson,
-      source
-    } = req.body;
-
-    if (!isValidId(sessionId) || !metricKey) {
-      return res.status(400).json({
-        error: "sessionId and metricKey are required"
-      });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO telemetry_metrics (
-         session_id, packet_id, lap_number, metric_key,
-         metric_value_num, metric_value_text, metric_value_bool,
-         metric_value_json, source
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       RETURNING *`,
-      [
-        Number(sessionId),
-        toInt(packetId),
-        toInt(lapNumber),
-        String(metricKey),
-        metricValueNum ?? null,
-        metricValueText ?? null,
-        typeof metricValueBool === "boolean" ? metricValueBool : null,
-        metricValueJson ?? null,
-        source ?? "manual"
-      ]
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    console.error("POST /telemetry/metric error:", err);
-    res.status(500).json({ error: "failed to save metric" });
-  }
-});
-
-app.get("/leaderboard", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT
-        p.name,
-        MIN(l.lap_time_ms) AS best_lap_ms
-      FROM lap_records l
-      JOIN sessions s ON s.id = l.session_id
-      JOIN players p ON p.id = s.player_id
-      WHERE l.valid = TRUE
-      GROUP BY p.name
-      ORDER BY best_lap_ms ASC
-      LIMIT 10
-    `);
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error("GET /leaderboard error:", err);
-    res.status(500).json({ error: "failed to fetch leaderboard" });
-  }
-});
-
-app.get("/schema", async (req, res) => {
+app.get("/schema", (req, res) => {
   res.json({
-    tables: [
-      "players",
-      "sessions",
-      "telemetry_packets",
-      "telemetry_metrics",
-      "lap_records"
-    ],
-    note: "telemetry_packets stores raw data; telemetry_metrics stores anything parsed later."
+    tables: ["players", "sessions", "telemetry_packets"],
+    strategy: "store raw packets first, parse into useful fields later"
   });
 });
 
