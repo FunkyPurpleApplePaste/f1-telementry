@@ -329,6 +329,13 @@ async function start() {
   app.listen(port, () => console.log("RUNNING", port));
 }
 
+app.get("/debug-firebase", (req, res) => {
+  res.json({
+    hasEnv: !!process.env.FIREBASE_SERVICE_ACCOUNT,
+    envLength: process.env.FIREBASE_SERVICE_ACCOUNT?.length || 0
+  });
+});
+
 start().catch((err) => {
   console.error("Startup error:", err);
   process.exit(1);
