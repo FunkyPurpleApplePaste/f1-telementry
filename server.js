@@ -14,13 +14,11 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 let credential;
-if (process.env.GOOGLE_APPLICATION_CREDENTIALS && fs.existsSync(process.env.GOOGLE_APPLICATION_CREDENTIALS)) {
-  const serviceAccount = JSON.parse(
-    fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS, "utf8")
-  );
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   credential = cert(serviceAccount);
 } else {
-  // Works in Google-hosted environments that provide ADC
   credential = applicationDefault();
 }
 
