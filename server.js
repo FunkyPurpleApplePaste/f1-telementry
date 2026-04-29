@@ -82,36 +82,23 @@ app.get("/health", (req, res) => {
 app.post("/players", async (req, res) => {
   try {
     const name = safeString(req.body.name);
-    if (!name) {
-      return res.status(400).json({ error: "name is required" });
-    }
+    if (!name) return res.status(400).json({ error: "name is required" });
 
     const playerId = playerDocIdFromName(name);
-    if (!playerId) {
-      return res.status(400).json({ error: "invalid player name" });
-    }
+    if (!playerId) return res.status(400).json({ error: "invalid player name" });
 
     const ref = db.collection("players").doc(playerId);
 
-    await db.runTransaction(async (tx) => {
-      const snap = await tx.get(ref);
-      if (snap.exists) {
-        throw new Error("PLAYER_EXISTS");
-      }
-      tx.set(ref, {
-        name,
-        createdAt: FieldValue.serverTimestamp()
-      });
+    await ref.set({
+      name,
+      createdAt: FieldValue.serverTimestamp()
     });
 
     const saved = await ref.get();
     res.status(201).json(serializeDoc(saved));
   } catch (err) {
-    if (err.message === "PLAYER_EXISTS") {
-      return res.status(409).json({ error: "player already exists" });
-    }
     console.error("POST /players error:", err);
-    res.status(500).json({ error: "failed to create player" });
+    res.status(500).json({ error: err.message });
   }
 });
 
