@@ -81,6 +81,20 @@ app.post("/players", async (req, res) => {
   }
 });
 
+app.get("/sessions", async (req, res) => {
+  try {
+    const snap = await db.collection("sessions")
+      .orderBy("startedAt", "desc")
+      .limit(20)
+      .get();
+    
+    res.json(snap.docs.map(serializeDoc));
+  } catch (err) {
+    console.error("GET /sessions error:", err);
+    res.status(500).json({ error: "failed to fetch sessions" });
+  }
+});
+
 app.post("/sessions", async (req, res) => {
   try {
     const playerId = safeString(req.body.playerId);
