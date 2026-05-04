@@ -28,7 +28,6 @@ app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 app.use(morgan("dev"));
 
-// --- Helper Functions ---
 function parseNumber(value, fallback = null) {
   if (value === undefined || value === null || value === "") return fallback;
   const n = Number(value);
@@ -62,28 +61,6 @@ function serializeDoc(docSnap) {
   }
   return out;
 }
-
-app.post("/telemetry/latest", async (req, res) => {
-  try {
-    const { sessionId, latestTelemetry } = req.body;
-
-    if (!sessionId || !latestTelemetry) {
-      return res.status(400).json({ error: "sessionId and latestTelemetry required" });
-    }
-
-    const sessionRef = db.collection("sessions").doc(sessionId);
-
-    await sessionRef.update({
-      latestTelemetry,
-      latestUpdatedAt: FieldValue.serverTimestamp()
-    });
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("latestTelemetry error:", err);
-    res.status(500).json({ error: "failed to update latest telemetry" });
-  }
-});
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -178,17 +155,53 @@ app.post("/sessions/:id/laps", async (req, res) => {
   }
 });
 
+app.post("/telemetry/latest", async (req, res) => {
+  try {
+    const sessionId = safeString(req.body.sessionId);
+    const latestTelemetry = req.body.latestTelemetry;
+
+    if (!sessionId || !latestTelemetry) {
+      return res.status(400).json({ error: "sessionId and latestTelemetry required" });
+    }
+
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const snap = await sessionRef.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
+    await sessionRef.set(
+      {
+        latestTelemetry,
+        latestTelemetryAt: FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("POST /telemetry/latest error:", err);
+    res.status(500).json({ error: "failed to update latest telemetry" });
+  }
+});
+
 app.post("/telemetry/batch", async (req, res) => {
   try {
-    const { sessionId, samples } = req.body;
+    const sessionId = safeString(req.body.sessionId);
+    const samples = req.body.samples;
+
     if (!sessionId) return res.status(400).json({ error: "sessionId is required" });
     if (!Array.isArray(samples) || samples.length === 0) {
       return res.status(400).json({ error: "samples array is required" });
     }
 
     const sessionRef = db.collection("sessions").doc(sessionId);
-    const chunkRef = sessionRef.collection("telemetryChunks").doc();
+    const sessionSnap = await sessionRef.get();
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
 
+    const chunkRef = sessionRef.collection("telemetryChunks").doc();
     const latestTelemetry = samples[samples.length - 1];
 
     await chunkRef.set({
