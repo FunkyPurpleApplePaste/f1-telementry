@@ -63,6 +63,28 @@ function serializeDoc(docSnap) {
   return out;
 }
 
+app.post("/telemetry/latest", async (req, res) => {
+  try {
+    const { sessionId, latestTelemetry } = req.body;
+
+    if (!sessionId || !latestTelemetry) {
+      return res.status(400).json({ error: "sessionId and latestTelemetry required" });
+    }
+
+    const sessionRef = db.collection("sessions").doc(sessionId);
+
+    await sessionRef.update({
+      latestTelemetry,
+      latestUpdatedAt: FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("latestTelemetry error:", err);
+    res.status(500).json({ error: "failed to update latest telemetry" });
+  }
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/players", async (req, res) => {
