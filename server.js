@@ -25,7 +25,7 @@ const db = getFirestore();
 
 app.use(helmet());
 app.use(cors());
-app.use(express.json({ limit: "5mb" })); // Increased limit slightly to handle arrays
+app.use(express.json({ limit: "5mb" }));
 app.use(morgan("dev"));
 
 // --- Helper Functions ---
@@ -55,7 +55,7 @@ function serializeDoc(docSnap) {
   const data = docSnap.data();
   const out = { id: docSnap.id, ...data };
 
-  for (const key of["createdAt", "startedAt", "endedAt", "receivedAt", "recordedAt"]) {
+  for (const key of ["createdAt", "startedAt", "endedAt", "receivedAt", "recordedAt", "latestTelemetryAt"]) {
     if (out[key] && typeof out[key].toDate === "function") {
       out[key] = out[key].toDate().toISOString();
     }
@@ -77,6 +77,7 @@ app.post("/players", async (req, res) => {
     const saved = await ref.get();
     res.status(201).json(serializeDoc(saved));
   } catch (err) {
+    console.error("POST /players error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -87,7 +88,7 @@ app.get("/sessions", async (req, res) => {
       .orderBy("startedAt", "desc")
       .limit(20)
       .get();
-    
+
     res.json(snap.docs.map(serializeDoc));
   } catch (err) {
     console.error("GET /sessions error:", err);
@@ -104,7 +105,9 @@ app.post("/sessions", async (req, res) => {
     await sessionRef.set({
       playerId,
       startedAt: FieldValue.serverTimestamp(),
-      endedAt: null
+      endedAt: null,
+      latestTelemetry: null,
+      latestTelemetryAt: null
     });
 
     const saved = await sessionRef.get();
@@ -119,7 +122,7 @@ app.post("/sessions/:id/end", async (req, res) => {
     const sessionId = safeString(req.params.id);
     const sessionRef = db.collection("sessions").doc(sessionId);
     await sessionRef.update({ endedAt: FieldValue.serverTimestamp() });
-    
+
     const updated = await sessionRef.get();
     res.json(serializeDoc(updated));
   } catch (err) {
@@ -138,7 +141,6 @@ app.post("/sessions/:id/laps", async (req, res) => {
     }
 
     const sessionRef = db.collection("sessions").doc(sessionId);
-    // Explicitly naming the document `lap_1`, `lap_2` prevents duplicate lap logging
     const lapRef = sessionRef.collection("laps").doc(`lap_${lapNumber}`);
 
     await lapRef.set({
@@ -154,7 +156,6 @@ app.post("/sessions/:id/laps", async (req, res) => {
   }
 });
 
-// UPGRADED: Chunked array storage for Telemetry Batching
 app.post("/telemetry/batch", async (req, res) => {
   try {
     const { sessionId, samples } = req.body;
@@ -166,11 +167,21 @@ app.post("/telemetry/batch", async (req, res) => {
     const sessionRef = db.collection("sessions").doc(sessionId);
     const chunkRef = sessionRef.collection("telemetryChunks").doc();
 
+    const latestTelemetry = samples[samples.length - 1];
+
     await chunkRef.set({
       samples,
       count: samples.length,
       receivedAt: FieldValue.serverTimestamp()
     });
+
+    await sessionRef.set(
+      {
+        latestTelemetry,
+        latestTelemetryAt: FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
 
     res.status(201).json({ success: true, count: samples.length });
   } catch (err) {
@@ -179,13 +190,12 @@ app.post("/telemetry/batch", async (req, res) => {
   }
 });
 
-
 function formatLapTime(ms) {
   if (!ms) return "--:--.---";
   const minutes = Math.floor(ms / 60000);
   const seconds = Math.floor((ms % 60000) / 1000);
   const fraction = ms % 1000;
-  return `${minutes}:${seconds.toString().padStart(2, '0')}.${fraction.toString().padStart(3, '0')}`;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}.${fraction.toString().padStart(3, "0")}`;
 }
 
 function downsample(data, targetCount = 500) {
@@ -215,8 +225,8 @@ app.get("/sessions/:id/processed", async (req, res) => {
     });
 
     const chunksSnap = await sessionRef.collection("telemetryChunks").orderBy("receivedAt", "asc").get();
-    
-    let allSamples =[];
+
+    let allSamples = [];
     chunksSnap.forEach(doc => {
       const chunkData = doc.data();
       if (Array.isArray(chunkData.samples)) {
@@ -228,12 +238,12 @@ app.get("/sessions/:id/processed", async (req, res) => {
 
     let maxSpeed = 0;
     let maxBrakingDistance = 0;
-    
+
     allSamples.forEach(sample => {
       if (sample.speedKph > maxSpeed) maxSpeed = sample.speedKph;
       if (sample.brakingDistance > maxBrakingDistance) maxBrakingDistance = sample.brakingDistance;
     });
-  
+
     const chartData = downsample(allSamples, 500);
 
     res.json({
@@ -242,12 +252,11 @@ app.get("/sessions/:id/processed", async (req, res) => {
         totalLaps: processedLaps.length,
         fastestLap: processedLaps.sort((a, b) => a.rawMs - b.rawMs)[0] || null,
         topSpeedKph: maxSpeed,
-        longestBrakingZoneMeters: Math.round(maxBrakingDistance * 10) / 10 
+        longestBrakingZoneMeters: Math.round(maxBrakingDistance * 10) / 10
       },
       laps: processedLaps,
       chartData: chartData
     });
-
   } catch (err) {
     console.error("GET /sessions/:id/processed error:", err);
     res.status(500).json({ error: "failed to process session data" });
@@ -256,11 +265,11 @@ app.get("/sessions/:id/processed", async (req, res) => {
 
 app.get("/schema", (req, res) => {
   res.json({
-    collections:[
+    collections: [
       "players",
       "sessions",
       "sessions/{sessionId}/telemetryChunks",
-      "sessions/{sessionId}/laps"            
+      "sessions/{sessionId}/laps"
     ],
     strategy: "Firestore documents + subcollections + JSON Array Chunks"
   });
