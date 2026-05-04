@@ -3,7 +3,6 @@ import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 import dotenv from "dotenv";
-import fs from "fs";
 
 import { initializeApp, applicationDefault, cert } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
@@ -14,7 +13,6 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 let credential;
-
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   credential = cert(serviceAccount);
@@ -27,9 +25,10 @@ const db = getFirestore();
 
 app.use(helmet());
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "5mb" })); // Increased limit slightly to handle arrays
 app.use(morgan("dev"));
 
+// --- Helper Functions ---
 function parseNumber(value, fallback = null) {
   if (value === undefined || value === null || value === "") return fallback;
   const n = Number(value);
@@ -49,35 +48,22 @@ function safeString(value, fallback = null) {
 }
 
 function playerDocIdFromName(name) {
-  return String(name)
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "_")
-    .replace(/^_+|_+$/g, "");
+  return String(name).trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
 function serializeDoc(docSnap) {
   const data = docSnap.data();
   const out = { id: docSnap.id, ...data };
 
-  for (const key of ["createdAt", "startedAt", "endedAt", "receivedAt", "timestamp"]) {
+  for (const key of["createdAt", "startedAt", "endedAt", "receivedAt", "recordedAt"]) {
     if (out[key] && typeof out[key].toDate === "function") {
       out[key] = out[key].toDate().toISOString();
     }
   }
-
   return out;
 }
 
-async function initDb() {
-  // Firestore does not need table creation.
-  // Collections/documents appear automatically on first write.
-  await Promise.resolve();
-}
-
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/players", async (req, res) => {
   try {
@@ -85,59 +71,24 @@ app.post("/players", async (req, res) => {
     if (!name) return res.status(400).json({ error: "name is required" });
 
     const playerId = playerDocIdFromName(name);
-    if (!playerId) return res.status(400).json({ error: "invalid player name" });
-
     const ref = db.collection("players").doc(playerId);
-
-    await ref.set({
-      name,
-      createdAt: FieldValue.serverTimestamp()
-    });
+    await ref.set({ name, createdAt: FieldValue.serverTimestamp() });
 
     const saved = await ref.get();
     res.status(201).json(serializeDoc(saved));
   } catch (err) {
-    console.error("POST /players error:", err);
     res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/players", async (req, res) => {
-  try {
-    const snap = await db.collection("players").orderBy("createdAt", "desc").get();
-    res.json(snap.docs.map(serializeDoc));
-  } catch (err) {
-    console.error("GET /players error:", err);
-    res.status(500).json({ error: "failed to fetch players" });
   }
 });
 
 app.post("/sessions", async (req, res) => {
   try {
     const playerId = safeString(req.body.playerId);
-    const track = safeString(req.body.track, null);
-    const car = safeString(req.body.car, null);
-    const gameVersion = safeString(req.body.gameVersion, null);
-    const notes = safeString(req.body.notes, null);
-
-    if (!playerId) {
-      return res.status(400).json({ error: "playerId is required" });
-    }
-
-    const playerRef = db.collection("players").doc(playerId);
-    const playerSnap = await playerRef.get();
-
-    if (!playerSnap.exists) {
-      return res.status(404).json({ error: "player not found" });
-    }
+    if (!playerId) return res.status(400).json({ error: "playerId is required" });
 
     const sessionRef = db.collection("sessions").doc();
     await sessionRef.set({
       playerId,
-      track,
-      car,
-      gameVersion,
-      notes,
       startedAt: FieldValue.serverTimestamp(),
       endedAt: null
     });
@@ -145,7 +96,6 @@ app.post("/sessions", async (req, res) => {
     const saved = await sessionRef.get();
     res.status(201).json(serializeDoc(saved));
   } catch (err) {
-    console.error("POST /sessions error:", err);
     res.status(500).json({ error: "failed to create session" });
   }
 });
@@ -154,174 +104,157 @@ app.post("/sessions/:id/end", async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
     const sessionRef = db.collection("sessions").doc(sessionId);
-    const sessionSnap = await sessionRef.get();
-
-    if (!sessionSnap.exists) {
-      return res.status(404).json({ error: "session not found" });
-    }
-
-    await sessionRef.update({
-      endedAt: FieldValue.serverTimestamp()
-    });
-
+    await sessionRef.update({ endedAt: FieldValue.serverTimestamp() });
+    
     const updated = await sessionRef.get();
     res.json(serializeDoc(updated));
   } catch (err) {
-    console.error("POST /sessions/:id/end error:", err);
     res.status(500).json({ error: "failed to end session" });
   }
 });
 
-app.get("/sessions/:id", async (req, res) => {
+app.post("/sessions/:id/laps", async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
-    if (!sessionId) {
-      return res.status(400).json({ error: "invalid session id" });
+    const lapNumber = parseInteger(req.body.lapNumber);
+    const lapTimeMs = parseInteger(req.body.lapTimeMs);
+
+    if (!sessionId || lapNumber === null) {
+      return res.status(400).json({ error: "sessionId and lapNumber required" });
     }
 
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    // Explicitly naming the document `lap_1`, `lap_2` prevents duplicate lap logging
+    const lapRef = sessionRef.collection("laps").doc(`lap_${lapNumber}`);
+
+    await lapRef.set({
+      lapNumber,
+      lapTimeMs,
+      recordedAt: FieldValue.serverTimestamp()
+    });
+
+    res.status(201).json({ success: true, lapNumber });
+  } catch (err) {
+    console.error("POST /sessions/:id/laps error:", err);
+    res.status(500).json({ error: "failed to save lap" });
+  }
+});
+
+// UPGRADED: Chunked array storage for Telemetry Batching
+app.post("/telemetry/batch", async (req, res) => {
+  try {
+    const { sessionId, samples } = req.body;
+    if (!sessionId) return res.status(400).json({ error: "sessionId is required" });
+    if (!Array.isArray(samples) || samples.length === 0) {
+      return res.status(400).json({ error: "samples array is required" });
+    }
+
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const chunkRef = sessionRef.collection("telemetryChunks").doc();
+
+    await chunkRef.set({
+      samples,
+      count: samples.length,
+      receivedAt: FieldValue.serverTimestamp()
+    });
+
+    res.status(201).json({ success: true, count: samples.length });
+  } catch (err) {
+    console.error("POST /telemetry/batch error:", err);
+    res.status(500).json({ error: "failed to save telemetry batch" });
+  }
+});
+
+
+function formatLapTime(ms) {
+  if (!ms) return "--:--.---";
+  const minutes = Math.floor(ms / 60000);
+  const seconds = Math.floor((ms % 60000) / 1000);
+  const fraction = ms % 1000;
+  return `${minutes}:${seconds.toString().padStart(2, '0')}.${fraction.toString().padStart(3, '0')}`;
+}
+
+function downsample(data, targetCount = 500) {
+  if (data.length <= targetCount) return data;
+  const step = Math.ceil(data.length / targetCount);
+  return data.filter((_, index) => index % step === 0);
+}
+
+app.get("/sessions/:id/processed", async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
     const sessionRef = db.collection("sessions").doc(sessionId);
     const sessionSnap = await sessionRef.get();
 
     if (!sessionSnap.exists) {
-      return res.status(404).json({ error: "session not found" });
+      return res.status(404).json({ error: "Session not found" });
     }
 
-    const [packetsSnap, samplesSnap] = await Promise.all([
-      sessionRef
-        .collection("telemetryPackets")
-        .orderBy("receivedAt", "asc")
-        .limit(500)
-        .get(),
-      sessionRef
-        .collection("telemetrySamples")
-        .orderBy("receivedAt", "asc")
-        .limit(5000)
-        .get()
-    ]);
+    const lapsSnap = await sessionRef.collection("laps").orderBy("lapNumber", "asc").get();
+    const processedLaps = lapsSnap.docs.map(doc => {
+      const data = doc.data();
+      return {
+        lapNumber: data.lapNumber,
+        rawMs: data.lapTimeMs,
+        formattedTime: formatLapTime(data.lapTimeMs)
+      };
+    });
+
+    const chunksSnap = await sessionRef.collection("telemetryChunks").orderBy("receivedAt", "asc").get();
+    
+    let allSamples =[];
+    chunksSnap.forEach(doc => {
+      const chunkData = doc.data();
+      if (Array.isArray(chunkData.samples)) {
+        allSamples.push(...chunkData.samples);
+      }
+    });
+
+    allSamples.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    let maxSpeed = 0;
+    let maxBrakingDistance = 0;
+    
+    allSamples.forEach(sample => {
+      if (sample.speedKph > maxSpeed) maxSpeed = sample.speedKph;
+      if (sample.brakingDistance > maxBrakingDistance) maxBrakingDistance = sample.brakingDistance;
+    });
+  
+    const chartData = downsample(allSamples, 500);
 
     res.json({
-      session: serializeDoc(sessionSnap),
-      packets: packetsSnap.docs.map(serializeDoc),
-      samples: samplesSnap.docs.map(serializeDoc)
-    });
-  } catch (err) {
-    console.error("GET /sessions/:id error:", err);
-    res.status(500).json({ error: "failed to fetch session" });
-  }
-});
-
-app.post("/telemetry/packet", async (req, res) => {
-  try {
-    const sessionId = safeString(req.body.sessionId);
-    const packetType = safeString(req.body.packetType);
-    const packetIndex = parseInteger(req.body.packetIndex);
-    const gameTimeMs = parseInteger(req.body.gameTimeMs);
-    const payload = req.body.payload;
-
-    if (!sessionId || !packetType || payload === undefined) {
-      return res.status(400).json({
-        error: "sessionId, packetType, and payload are required"
-      });
-    }
-
-    const sessionRef = db.collection("sessions").doc(sessionId);
-    const sessionSnap = await sessionRef.get();
-
-    if (!sessionSnap.exists) {
-      return res.status(404).json({ error: "session not found" });
-    }
-
-    const packetRef = sessionRef.collection("telemetryPackets").doc();
-    await packetRef.set({
-      packetIndex,
-      packetType,
-      gameTimeMs,
-      payload,
-      receivedAt: FieldValue.serverTimestamp()
+      sessionInfo: serializeDoc(sessionSnap),
+      insights: {
+        totalLaps: processedLaps.length,
+        fastestLap: processedLaps.sort((a, b) => a.rawMs - b.rawMs)[0] || null,
+        topSpeedKph: maxSpeed,
+        longestBrakingZoneMeters: Math.round(maxBrakingDistance * 10) / 10 
+      },
+      laps: processedLaps,
+      chartData: chartData
     });
 
-    const saved = await packetRef.get();
-    res.status(201).json(serializeDoc(saved));
   } catch (err) {
-    console.error("POST /telemetry/packet error:", err);
-    res.status(500).json({ error: "failed to save telemetry packet" });
-  }
-});
-
-app.post("/telemetry/sample", async (req, res) => {
-  try {
-    const sessionId = safeString(req.body.sessionId);
-    const sampleIndex = parseInteger(req.body.sampleIndex);
-    const timestamp = req.body.timestamp ? new Date(req.body.timestamp) : null;
-
-    const speedKph = parseInteger(req.body.speedKph);
-    const throttle = parseNumber(req.body.throttle);
-    const brake = parseNumber(req.body.brake);
-    const steer = parseNumber(req.body.steer);
-    const gear = parseInteger(req.body.gear);
-    const rpm = parseInteger(req.body.rpm);
-    const drs = parseInteger(req.body.drs);
-    const playerCarIndex = parseInteger(req.body.playerCarIndex);
-    const payload = req.body.payload;
-
-    if (!sessionId) {
-      return res.status(400).json({ error: "sessionId is required" });
-    }
-
-    const sessionRef = db.collection("sessions").doc(sessionId);
-    const sessionSnap = await sessionRef.get();
-
-    if (!sessionSnap.exists) {
-      return res.status(404).json({ error: "session not found" });
-    }
-
-    const sampleRef = sessionRef.collection("telemetrySamples").doc();
-    await sampleRef.set({
-      sampleIndex,
-      timestamp: timestamp && !Number.isNaN(timestamp.getTime()) ? timestamp : FieldValue.serverTimestamp(),
-      speedKph,
-      throttle,
-      brake,
-      steer,
-      gear,
-      rpm,
-      drs,
-      playerCarIndex,
-      payload: payload ?? null,
-      receivedAt: FieldValue.serverTimestamp()
-    });
-
-    const saved = await sampleRef.get();
-    res.status(201).json(serializeDoc(saved));
-  } catch (err) {
-    console.error("POST /telemetry/sample error:", err);
-    res.status(500).json({ error: "failed to save telemetry sample" });
+    console.error("GET /sessions/:id/processed error:", err);
+    res.status(500).json({ error: "failed to process session data" });
   }
 });
 
 app.get("/schema", (req, res) => {
   res.json({
-    collections: [
+    collections:[
       "players",
       "sessions",
-      "sessions/{sessionId}/telemetryPackets",
-      "sessions/{sessionId}/telemetrySamples"
+      "sessions/{sessionId}/telemetryChunks",
+      "sessions/{sessionId}/laps"            
     ],
-    strategy: "Firestore documents + subcollections"
+    strategy: "Firestore documents + subcollections + JSON Array Chunks"
   });
 });
 
 async function start() {
-  await initDb();
-  app.listen(port, () => console.log("RUNNING", port));
+  app.listen(port, () => console.log("API RUNNING on port", port));
 }
-
-app.get("/debug-firebase", (req, res) => {
-  res.json({
-    hasEnv: !!process.env.FIREBASE_SERVICE_ACCOUNT,
-    envLength: process.env.FIREBASE_SERVICE_ACCOUNT?.length || 0
-  });
-});
 
 start().catch((err) => {
   console.error("Startup error:", err);

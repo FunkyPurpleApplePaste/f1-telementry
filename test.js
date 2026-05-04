@@ -1,26 +1,24 @@
-const fetch = require("node-fetch");
-
 const BASE = "https://f1-telementry-1.onrender.com";
 
 async function test() {
-  // Create player
-  await fetch(`${BASE}/players`, {
+  const p = await fetch(`${BASE}/players`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "test_player2" })
   });
 
-  // Create session
-  const sessionRes = await fetch(`${BASE}/sessions`, {
+  console.log("player:", await p.text());
+
+  const s = await fetch(`${BASE}/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ playerId: "test_player2" })
   });
 
-  const session = await sessionRes.json();
+  const session = await s.json();
+  console.log("session:", session);
 
-  // Send telemetry
-  await fetch(`${BASE}/telemetry/sample`, {
+  const t = await fetch(`${BASE}/telemetry/sample`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -30,7 +28,7 @@ async function test() {
     })
   });
 
-  console.log("Done");
+  console.log("telemetry:", await t.text());
 }
 
 test();
