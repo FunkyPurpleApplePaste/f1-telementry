@@ -188,6 +188,9 @@ app.post("/sessions", async (req, res) => {
   try {
     const playerId = safeString(req.body.playerId);
     const playerName = safeString(req.body.playerName, null);
+    const trackName = safeString(req.body.trackName, null);
+    const trackId = parseInteger(req.body.trackId, null);
+    const sessionType = parseInteger(req.body.sessionType, null);
 
     if (!playerId) return res.status(400).json({ error: "playerId is required" });
 
@@ -195,6 +198,9 @@ app.post("/sessions", async (req, res) => {
     await sessionRef.set({
       playerId,
       playerName,
+      trackName,
+      trackId,
+      sessionType,
       startedAt: FieldValue.serverTimestamp(),
       endedAt: null,
       latestTelemetry: null,
@@ -244,6 +250,8 @@ app.post("/sessions/:id/laps", async (req, res) => {
     const sessionId = safeString(req.params.id);
     const lapNumber = parseInteger(req.body.lapNumber);
     const lapTimeMs = parseInteger(req.body.lapTimeMs);
+    const trackName = safeString(req.body.trackName, null);
+    const trackId = parseInteger(req.body.trackId, null);
 
     if (!sessionId || lapNumber === null) {
       return res.status(400).json({ error: "sessionId and lapNumber required" });
@@ -259,6 +267,8 @@ app.post("/sessions/:id/laps", async (req, res) => {
     const lapData = {
       lapNumber,
       lapTimeMs,
+      trackName,
+      trackId,
       recordedAt: FieldValue.serverTimestamp()
     };
 
