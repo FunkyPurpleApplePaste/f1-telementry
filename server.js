@@ -225,6 +225,32 @@ app.post("/sessions", async (req, res) => {
   }
 });
 
+app.patch("/sessions/:id", async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
+    const updateBody = {};
+    if (req.body.trackId !== undefined) updateBody.trackId = parseInteger(req.body.trackId, null);
+    if (req.body.trackName !== undefined) updateBody.trackName = safeString(req.body.trackName, null);
+    if (req.body.sessionType !== undefined) updateBody.sessionType = parseInteger(req.body.sessionType, null);
+    if (req.body.playerName !== undefined) updateBody.playerName = safeString(req.body.playerName, null);
+
+    await sessionRef.set(updateBody, { merge: true });
+
+    const updated = await sessionRef.get();
+    res.json(serializeDoc(updated));
+  } catch (err) {
+    console.error("PATCH /sessions/:id error:", err);
+    res.status(500).json({ error: "failed to update session" });
+  }
+});
+
 app.post("/sessions/:id/end", async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
@@ -291,6 +317,53 @@ app.post("/sessions/:id/laps", async (req, res) => {
   } catch (err) {
     console.error("POST /sessions/:id/laps error:", err);
     res.status(500).json({ error: "failed to save lap" });
+  }
+});
+
+app.post("/sessions/:id/corners", async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
+    const cornerRef = sessionRef.collection("corners").doc();
+
+    await cornerRef.set({
+      cornerIndex: parseInteger(req.body.cornerIndex, null),
+      trackId: parseInteger(req.body.trackId, null),
+      trackName: safeString(req.body.trackName, null),
+
+      startedAt: safeString(req.body.startedAt, null),
+      endedAt: safeString(req.body.endedAt, null),
+      durationMs: parseInteger(req.body.durationMs, null),
+
+      startLapNumber: parseInteger(req.body.startLapNumber, null),
+      endLapNumber: parseInteger(req.body.endLapNumber, null),
+
+      startLapDistanceM: parseNumber(req.body.startLapDistanceM, null),
+      endLapDistanceM: parseNumber(req.body.endLapDistanceM, null),
+
+      startTotalDistanceM: parseNumber(req.body.startTotalDistanceM, null),
+      endTotalDistanceM: parseNumber(req.body.endTotalDistanceM, null),
+
+      startSpeedKph: parseNumber(req.body.startSpeedKph, null),
+      endSpeedKph: parseNumber(req.body.endSpeedKph, null),
+
+      maxAbsSteering: parseNumber(req.body.maxAbsSteering, null),
+      endReason: safeString(req.body.endReason, null),
+
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    const saved = await cornerRef.get();
+    res.status(201).json(serializeDoc(saved));
+  } catch (err) {
+    console.error("POST /sessions/:id/corners error:", err);
+    res.status(500).json({ error: "failed to save corner" });
   }
 });
 
@@ -409,7 +482,8 @@ app.get("/schema", (req, res) => {
       "players",
       "sessions",
       "sessions/{sessionId}/telemetryChunks",
-      "sessions/{sessionId}/laps"
+      "sessions/{sessionId}/laps",
+      "sessions/{sessionId}/corners"
     ],
     strategy: "Session doc holds latestTelemetry + processedSummary"
   });
