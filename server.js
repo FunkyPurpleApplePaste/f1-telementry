@@ -154,9 +154,13 @@ app.post("/players", async (req, res) => {
     const name = safeString(req.body.name);
     if (!name) return res.status(400).json({ error: "name is required" });
 
-    const playerId = playerDocIdFromName(name);
-    const ref = db.collection("players").doc(playerId);
-    await ref.set({ name, createdAt: FieldValue.serverTimestamp() });
+    const ref = db.collection("players").doc(); // new doc every time
+
+    await ref.set({
+      name,
+      createdAt: FieldValue.serverTimestamp(),
+      lastSeenAt: FieldValue.serverTimestamp()
+    });
 
     const saved = await ref.get();
     res.status(201).json(serializeDoc(saved));
@@ -183,11 +187,14 @@ app.get("/sessions", async (req, res) => {
 app.post("/sessions", async (req, res) => {
   try {
     const playerId = safeString(req.body.playerId);
+    const playerName = safeString(req.body.playerName, null);
+
     if (!playerId) return res.status(400).json({ error: "playerId is required" });
 
     const sessionRef = db.collection("sessions").doc();
     await sessionRef.set({
       playerId,
+      playerName,
       startedAt: FieldValue.serverTimestamp(),
       endedAt: null,
       latestTelemetry: null,
@@ -200,13 +207,14 @@ app.post("/sessions", async (req, res) => {
         fastestLap: null,
         currentLapNumber: null,
         bestLapTimeMs: null,
-        lastLapTimeMs: null,
+        lastLapTimeMs: null
       }
     });
 
     const saved = await sessionRef.get();
     res.status(201).json(serializeDoc(saved));
   } catch (err) {
+    console.error("POST /sessions error:", err);
     res.status(500).json({ error: "failed to create session" });
   }
 });
