@@ -47,7 +47,11 @@ function safeString(value, fallback = null) {
 }
 
 function playerDocIdFromName(name) {
-  return String(name).trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
+  return String(name)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
 }
 
 function serializeDoc(docSnap) {
@@ -59,7 +63,88 @@ function serializeDoc(docSnap) {
       out[key] = out[key].toDate().toISOString();
     }
   }
+
   return out;
+}
+
+function formatLapTime(ms) {
+  if (!ms) return "--:--.---";
+  const minutes = Math.floor(ms / 60000);
+  const seconds = Math.floor((ms % 60000) / 1000);
+  const fraction = ms % 1000;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}.${fraction.toString().padStart(3, "0")}`;
+}
+
+function downsample(data, targetCount = 500) {
+  if (data.length <= targetCount) return data;
+  const step = Math.ceil(data.length / targetCount);
+  return data.filter((_, index) => index % step === 0);
+}
+
+function mergeProcessedSummary(existing = {}, incoming = {}, latestLap = null) {
+  const out = {
+    totalSamples: parseInteger(existing.totalSamples, 0) || 0,
+    totalLaps: parseInteger(existing.totalLaps, 0) || 0,
+    topSpeedKph: parseNumber(existing.topSpeedKph, 0) || 0,
+    longestBrakingZoneMeters: parseNumber(existing.longestBrakingZoneMeters, 0) || 0,
+    fastestLap: existing.fastestLap ?? null,
+    currentLapNumber: existing.currentLapNumber ?? null,
+    bestLapTimeMs: existing.bestLapTimeMs ?? null,
+    lastLapTimeMs: existing.lastLapTimeMs ?? null,
+  };
+
+  const incSamples = parseInteger(incoming.totalSamples, 0) || 0;
+  out.totalSamples += incSamples;
+
+  if (incoming.topSpeedKph != null && incoming.topSpeedKph > out.topSpeedKph) {
+    out.topSpeedKph = incoming.topSpeedKph;
+  }
+
+  if (incoming.longestBrakingZoneMeters != null && incoming.longestBrakingZoneMeters > out.longestBrakingZoneMeters) {
+    out.longestBrakingZoneMeters = incoming.longestBrakingZoneMeters;
+  }
+
+  if (incoming.currentLapNumber != null) {
+    out.currentLapNumber = incoming.currentLapNumber;
+  }
+
+  if (incoming.bestLapTimeMs != null) {
+    if (out.bestLapTimeMs == null || incoming.bestLapTimeMs < out.bestLapTimeMs) {
+      out.bestLapTimeMs = incoming.bestLapTimeMs;
+    }
+  }
+
+  if (latestLap && latestLap.lapNumber != null) {
+    out.lastLapTimeMs = latestLap.lapTimeMs ?? out.lastLapTimeMs;
+    out.totalLaps = Math.max(out.totalLaps, latestLap.lapNumber);
+    if (latestLap.lapTimeMs != null) {
+      if (!out.fastestLap || latestLap.lapTimeMs < out.fastestLap.rawMs) {
+        out.fastestLap = {
+          lapNumber: latestLap.lapNumber,
+          rawMs: latestLap.lapTimeMs,
+          formattedTime: formatLapTime(latestLap.lapTimeMs),
+        };
+      }
+    }
+  }
+
+  return out;
+}
+
+async function applySessionSummary(sessionRef, patch, latestLap = null) {
+  const snap = await sessionRef.get();
+  if (!snap.exists) return;
+
+  const current = snap.data() || {};
+  const mergedSummary = mergeProcessedSummary(current.processedSummary || {}, patch, latestLap);
+
+  const updateBody = {
+    latestTelemetry: patch.latestTelemetry ?? current.latestTelemetry ?? null,
+    latestTelemetryAt: FieldValue.serverTimestamp(),
+    processedSummary: mergedSummary,
+  };
+
+  await sessionRef.set(updateBody, { merge: true });
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -106,7 +191,17 @@ app.post("/sessions", async (req, res) => {
       startedAt: FieldValue.serverTimestamp(),
       endedAt: null,
       latestTelemetry: null,
-      latestTelemetryAt: null
+      latestTelemetryAt: null,
+      processedSummary: {
+        totalSamples: 0,
+        totalLaps: 0,
+        topSpeedKph: 0,
+        longestBrakingZoneMeters: 0,
+        fastestLap: null,
+        currentLapNumber: null,
+        bestLapTimeMs: null,
+        lastLapTimeMs: null,
+      }
     });
 
     const saved = await sessionRef.get();
@@ -120,11 +215,18 @@ app.post("/sessions/:id/end", async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
     const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
     await sessionRef.update({ endedAt: FieldValue.serverTimestamp() });
 
     const updated = await sessionRef.get();
     res.json(serializeDoc(updated));
   } catch (err) {
+    console.error("POST /sessions/:id/end error:", err);
     res.status(500).json({ error: "failed to end session" });
   }
 });
@@ -140,13 +242,32 @@ app.post("/sessions/:id/laps", async (req, res) => {
     }
 
     const sessionRef = db.collection("sessions").doc(sessionId);
-    const lapRef = sessionRef.collection("laps").doc(`lap_${lapNumber}`);
+    const sessionSnap = await sessionRef.get();
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
 
-    await lapRef.set({
+    const lapRef = sessionRef.collection("laps").doc(`lap_${lapNumber}`);
+    const lapData = {
       lapNumber,
       lapTimeMs,
       recordedAt: FieldValue.serverTimestamp()
+    };
+
+    await lapRef.set(lapData);
+
+    const currentSummary = sessionSnap.data()?.processedSummary || {};
+    const nextSummary = mergeProcessedSummary(currentSummary, {}, {
+      lapNumber,
+      lapTimeMs
     });
+
+    await sessionRef.set(
+      {
+        processedSummary: nextSummary
+      },
+      { merge: true }
+    );
 
     res.status(201).json({ success: true, lapNumber });
   } catch (err) {
@@ -165,8 +286,8 @@ app.post("/telemetry/latest", async (req, res) => {
     }
 
     const sessionRef = db.collection("sessions").doc(sessionId);
-    const snap = await sessionRef.get();
-    if (!snap.exists) {
+    const sessionSnap = await sessionRef.get();
+    if (!sessionSnap.exists) {
       return res.status(404).json({ error: "session not found" });
     }
 
@@ -204,16 +325,55 @@ app.post("/telemetry/batch", async (req, res) => {
     const chunkRef = sessionRef.collection("telemetryChunks").doc();
     const latestTelemetry = samples[samples.length - 1];
 
+    let maxSpeed = 0;
+    let longestBrakingZoneMeters = 0;
+    let currentLapNumber = null;
+    let bestLapTimeMs = sessionSnap.data()?.processedSummary?.bestLapTimeMs ?? null;
+    let fastestLap = sessionSnap.data()?.processedSummary?.fastestLap ?? null;
+
+    for (const s of samples) {
+      if (s?.speedKph != null && s.speedKph > maxSpeed) {
+        maxSpeed = s.speedKph;
+      }
+      if (s?.brakingDistance != null && s.brakingDistance > longestBrakingZoneMeters) {
+        longestBrakingZoneMeters = s.brakingDistance;
+      }
+      if (s?.lapNumber != null) {
+        currentLapNumber = s.lapNumber;
+      }
+      if (s?.deltaToPB != null) {
+        const candidate = parseInteger(s.deltaToPB, null);
+        if (candidate != null) {
+          if (bestLapTimeMs == null || candidate < bestLapTimeMs) {
+            bestLapTimeMs = candidate;
+          }
+        }
+      }
+    }
+
     await chunkRef.set({
       samples,
       count: samples.length,
       receivedAt: FieldValue.serverTimestamp()
     });
 
+    const currentSummary = sessionSnap.data()?.processedSummary || {};
+    const mergedSummary = {
+      totalSamples: (parseInteger(currentSummary.totalSamples, 0) || 0) + samples.length,
+      totalLaps: currentSummary.totalLaps || 0,
+      topSpeedKph: Math.max(parseNumber(currentSummary.topSpeedKph, 0) || 0, maxSpeed),
+      longestBrakingZoneMeters: Math.max(parseNumber(currentSummary.longestBrakingZoneMeters, 0) || 0, longestBrakingZoneMeters),
+      fastestLap: fastestLap,
+      currentLapNumber: currentLapNumber ?? currentSummary.currentLapNumber ?? null,
+      bestLapTimeMs: bestLapTimeMs ?? currentSummary.bestLapTimeMs ?? null,
+      lastLapTimeMs: currentSummary.lastLapTimeMs ?? null,
+    };
+
     await sessionRef.set(
       {
         latestTelemetry,
-        latestTelemetryAt: FieldValue.serverTimestamp()
+        latestTelemetryAt: FieldValue.serverTimestamp(),
+        processedSummary: mergedSummary
       },
       { merge: true }
     );
@@ -225,79 +385,6 @@ app.post("/telemetry/batch", async (req, res) => {
   }
 });
 
-function formatLapTime(ms) {
-  if (!ms) return "--:--.---";
-  const minutes = Math.floor(ms / 60000);
-  const seconds = Math.floor((ms % 60000) / 1000);
-  const fraction = ms % 1000;
-  return `${minutes}:${seconds.toString().padStart(2, "0")}.${fraction.toString().padStart(3, "0")}`;
-}
-
-function downsample(data, targetCount = 500) {
-  if (data.length <= targetCount) return data;
-  const step = Math.ceil(data.length / targetCount);
-  return data.filter((_, index) => index % step === 0);
-}
-
-app.get("/sessions/:id/processed", async (req, res) => {
-  try {
-    const sessionId = safeString(req.params.id);
-    const sessionRef = db.collection("sessions").doc(sessionId);
-    const sessionSnap = await sessionRef.get();
-
-    if (!sessionSnap.exists) {
-      return res.status(404).json({ error: "Session not found" });
-    }
-
-    const lapsSnap = await sessionRef.collection("laps").orderBy("lapNumber", "asc").get();
-    const processedLaps = lapsSnap.docs.map(doc => {
-      const data = doc.data();
-      return {
-        lapNumber: data.lapNumber,
-        rawMs: data.lapTimeMs,
-        formattedTime: formatLapTime(data.lapTimeMs)
-      };
-    });
-
-    const chunksSnap = await sessionRef.collection("telemetryChunks").orderBy("receivedAt", "asc").get();
-
-    let allSamples = [];
-    chunksSnap.forEach(doc => {
-      const chunkData = doc.data();
-      if (Array.isArray(chunkData.samples)) {
-        allSamples.push(...chunkData.samples);
-      }
-    });
-
-    allSamples.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-
-    let maxSpeed = 0;
-    let maxBrakingDistance = 0;
-
-    allSamples.forEach(sample => {
-      if (sample.speedKph > maxSpeed) maxSpeed = sample.speedKph;
-      if (sample.brakingDistance > maxBrakingDistance) maxBrakingDistance = sample.brakingDistance;
-    });
-
-    const chartData = downsample(allSamples, 500);
-
-    res.json({
-      sessionInfo: serializeDoc(sessionSnap),
-      insights: {
-        totalLaps: processedLaps.length,
-        fastestLap: processedLaps.sort((a, b) => a.rawMs - b.rawMs)[0] || null,
-        topSpeedKph: maxSpeed,
-        longestBrakingZoneMeters: Math.round(maxBrakingDistance * 10) / 10
-      },
-      laps: processedLaps,
-      chartData: chartData
-    });
-  } catch (err) {
-    console.error("GET /sessions/:id/processed error:", err);
-    res.status(500).json({ error: "failed to process session data" });
-  }
-});
-
 app.get("/schema", (req, res) => {
   res.json({
     collections: [
@@ -306,7 +393,7 @@ app.get("/schema", (req, res) => {
       "sessions/{sessionId}/telemetryChunks",
       "sessions/{sessionId}/laps"
     ],
-    strategy: "Firestore documents + subcollections + JSON Array Chunks"
+    strategy: "Session doc holds latestTelemetry + processedSummary"
   });
 });
 
