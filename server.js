@@ -464,10 +464,29 @@ app.post("/sessions/:id/laps", async (req, res) => {
     await lapRef.set(lapData);
 
     const currentSummary = sessionSnap.data()?.processedSummary || {};
-    const nextSummary = mergeProcessedSummary(currentSummary, {}, {
-      lapNumber,
-      lapTimeMs,
-    });
+    const nextBestLap =
+      lapTimeMs != null &&
+      (currentSummary.bestLapTimeMs == null || lapTimeMs < currentSummary.bestLapTimeMs)
+        ? lapTimeMs
+        : currentSummary.bestLapTimeMs ?? null;
+
+    const nextFastestLap =
+      lapTimeMs != null &&
+      (!currentSummary.fastestLap || lapTimeMs < currentSummary.fastestLap.rawMs)
+        ? {
+            lapNumber,
+            rawMs: lapTimeMs,
+            formattedTime: formatLapTime(lapTimeMs),
+          }
+        : currentSummary.fastestLap ?? null;
+
+    const nextSummary = {
+      ...currentSummary,
+      totalLaps: Math.max(parseInteger(currentSummary.totalLaps, 0) || 0, lapNumber),
+      lastLapTimeMs: lapTimeMs,
+      bestLapTimeMs: nextBestLap,
+      fastestLap: nextFastestLap,
+    };
 
     await sessionRef.set(
       {
@@ -584,8 +603,6 @@ app.post("/telemetry/batch", async (req, res) => {
     let maxSpeed = 0;
     let longestBrakingZoneMeters = 0;
     let currentLapNumber = null;
-    let bestLapTimeMs = sessionSnap.data()?.processedSummary?.bestLapTimeMs ?? null;
-    let fastestLap = sessionSnap.data()?.processedSummary?.fastestLap ?? null;
 
     for (const s of samples) {
       if (s?.speedKph != null && s.speedKph > maxSpeed) {
@@ -597,14 +614,6 @@ app.post("/telemetry/batch", async (req, res) => {
       if (s?.lapNumber != null) {
         currentLapNumber = s.lapNumber;
       }
-      if (s?.deltaToPB != null) {
-        const candidate = parseInteger(s.deltaToPB, null);
-        if (candidate != null) {
-          if (bestLapTimeMs == null || candidate < bestLapTimeMs) {
-            bestLapTimeMs = candidate;
-          }
-        }
-      }
     }
 
     await chunkRef.set({
@@ -614,6 +623,7 @@ app.post("/telemetry/batch", async (req, res) => {
     });
 
     const currentSummary = sessionSnap.data()?.processedSummary || {};
+
     const mergedSummary = {
       totalSamples: (parseInteger(currentSummary.totalSamples, 0) || 0) + samples.length,
       totalLaps: currentSummary.totalLaps || 0,
@@ -622,9 +632,9 @@ app.post("/telemetry/batch", async (req, res) => {
         parseNumber(currentSummary.longestBrakingZoneMeters, 0) || 0,
         longestBrakingZoneMeters
       ),
-      fastestLap: fastestLap,
+      fastestLap: currentSummary.fastestLap ?? null,
       currentLapNumber: currentLapNumber ?? currentSummary.currentLapNumber ?? null,
-      bestLapTimeMs: bestLapTimeMs ?? currentSummary.bestLapTimeMs ?? null,
+      bestLapTimeMs: currentSummary.bestLapTimeMs ?? null,
       lastLapTimeMs: currentSummary.lastLapTimeMs ?? null,
     };
 
@@ -643,7 +653,6 @@ app.post("/telemetry/batch", async (req, res) => {
     res.status(500).json({ error: "failed to save telemetry batch" });
   }
 });
-
 app.get("/schema", (req, res) => {
   res.json({
     collections: [
