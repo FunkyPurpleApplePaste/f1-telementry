@@ -453,7 +453,7 @@ app.post("/sessions/:id/laps", async (req, res) => {
     const sector1Ms = parseInteger(req.body.sector1Ms, null);
     const sector2Ms = parseInteger(req.body.sector2Ms, null);
     const sector3Ms = parseInteger(req.body.sector3Ms, null);
-    const valid = parseBoolean(req.body.valid, true);
+    const valid = parseBoolean(req.body.valid, false);
     const trackName = safeString(req.body.trackName, null);
     const trackId = parseInteger(req.body.trackId, null);
 
