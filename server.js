@@ -80,6 +80,17 @@ function serializeDoc(docSnap) {
   return out;
 }
 
+function parseBoolean(value, fallback = null) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+
+  const s = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "y", "on"].includes(s)) return true;
+  if (["false", "0", "no", "n", "off"].includes(s)) return false;
+  return fallback;
+}
+
 function formatLapTime(ms) {
   if (!ms) return "--:--.---";
   const minutes = Math.floor(ms / 60000);
@@ -439,6 +450,10 @@ app.post("/sessions/:id/laps", async (req, res) => {
     const sessionId = safeString(req.params.id);
     const lapNumber = parseInteger(req.body.lapNumber);
     const lapTimeMs = parseInteger(req.body.lapTimeMs);
+    const sector1Ms = parseInteger(req.body.sector1Ms, null);
+    const sector2Ms = parseInteger(req.body.sector2Ms, null);
+    const sector3Ms = parseInteger(req.body.sector3Ms, null);
+    const valid = parseBoolean(req.body.valid, true);
     const trackName = safeString(req.body.trackName, null);
     const trackId = parseInteger(req.body.trackId, null);
 
@@ -453,9 +468,20 @@ app.post("/sessions/:id/laps", async (req, res) => {
     }
 
     const lapRef = sessionRef.collection("laps").doc(`lap_${lapNumber}`);
+
+    const effectiveSector3Ms =
+      sector3Ms ??
+      (lapTimeMs != null && sector1Ms != null && sector2Ms != null
+        ? Math.max(0, lapTimeMs - sector1Ms - sector2Ms)
+        : null);
+
     const lapData = {
       lapNumber,
       lapTimeMs,
+      sector1Ms,
+      sector2Ms,
+      sector3Ms: effectiveSector3Ms,
+      valid,
       trackName,
       trackId,
       recordedAt: FieldValue.serverTimestamp(),
@@ -464,13 +490,17 @@ app.post("/sessions/:id/laps", async (req, res) => {
     await lapRef.set(lapData);
 
     const currentSummary = sessionSnap.data()?.processedSummary || {};
+    const lapIsValid = valid !== false;
+
     const nextBestLap =
+      lapIsValid &&
       lapTimeMs != null &&
       (currentSummary.bestLapTimeMs == null || lapTimeMs < currentSummary.bestLapTimeMs)
         ? lapTimeMs
         : currentSummary.bestLapTimeMs ?? null;
 
     const nextFastestLap =
+      lapIsValid &&
       lapTimeMs != null &&
       (!currentSummary.fastestLap || lapTimeMs < currentSummary.fastestLap.rawMs)
         ? {
