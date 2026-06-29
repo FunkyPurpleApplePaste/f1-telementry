@@ -1,3 +1,14 @@
+// backend_with_map.js
+// Drop-in replacement for your Express/Firebase backend.
+// Keeps your existing user/session/lap/corner/telemetry routes.
+// Adds map-ready storage:
+//   - latestTelemetry.worldX/worldY/worldZ
+//   - sessions/{sessionId}.latestMapPosition
+//   - sessions/{sessionId}.mapSummary
+//   - sessions/{sessionId}/telemetryChunks/{chunkId}.mapBounds
+//   - trackMaps/{trackKey}
+//   - trackMaps/{trackKey}/centerlineChunks/{chunkId}
+
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -25,7 +36,7 @@ const db = getFirestore();
 
 app.use(helmet());
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(morgan("dev"));
 
 function parseNumber(value, fallback = null) {
@@ -59,6 +70,35 @@ function normalizeEmail(value) {
   return s ? s.toLowerCase() : null;
 }
 
+function parseBoolean(value, fallback = null) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+
+  const s = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "y", "on"].includes(s)) return true;
+  if (["false", "0", "no", "n", "off"].includes(s)) return false;
+  return fallback;
+}
+
+function stripUndefinedDeep(value) {
+  if (Array.isArray(value)) {
+    return value.map(stripUndefinedDeep);
+  }
+
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, child] of Object.entries(value)) {
+      if (child !== undefined) {
+        out[key] = stripUndefinedDeep(child);
+      }
+    }
+    return out;
+  }
+
+  return value;
+}
+
 function serializeDoc(docSnap) {
   const data = docSnap.data();
   const out = { id: docSnap.id, ...data };
@@ -71,6 +111,10 @@ function serializeDoc(docSnap) {
     "recordedAt",
     "latestTelemetryAt",
     "lastSeenAt",
+    "updatedAt",
+    "calibratedAt",
+    "finalizedAt",
+    "createdFromSessionAt",
   ]) {
     if (out[key] && typeof out[key].toDate === "function") {
       out[key] = out[key].toDate().toISOString();
@@ -78,17 +122,6 @@ function serializeDoc(docSnap) {
   }
 
   return out;
-}
-
-function parseBoolean(value, fallback = null) {
-  if (value === undefined || value === null || value === "") return fallback;
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value !== 0;
-
-  const s = String(value).trim().toLowerCase();
-  if (["true", "1", "yes", "y", "on"].includes(s)) return true;
-  if (["false", "0", "no", "n", "off"].includes(s)) return false;
-  return fallback;
 }
 
 function formatLapTime(ms) {
@@ -99,6 +132,226 @@ function formatLapTime(ms) {
   return `${minutes}:${seconds.toString().padStart(2, "0")}.${fraction
     .toString()
     .padStart(3, "0")}`;
+}
+
+function trackKeyFrom(trackId, trackName) {
+  const id = parseInteger(trackId, null);
+  if (id !== null) return `track_${id}`;
+
+  const name = normalizeUsername(trackName || "unknown_track");
+  return `track_${name || "unknown_track"}`;
+}
+
+function finiteNumberOrNull(value) {
+  const n = parseNumber(value, null);
+  return n === null ? null : n;
+}
+
+function extractMapPoint(sample) {
+  if (!sample || typeof sample !== "object") return null;
+
+  const mapPosition = sample.mapPosition || {};
+  const worldX = finiteNumberOrNull(sample.worldX ?? mapPosition.worldX);
+  const worldY = finiteNumberOrNull(sample.worldY ?? mapPosition.worldY);
+  const worldZ = finiteNumberOrNull(sample.worldZ ?? mapPosition.worldZ);
+
+  if (worldX === null || worldZ === null) return null;
+
+  return {
+    timestamp: safeString(sample.timestamp, null),
+    sampleIndex: parseInteger(sample.sampleIndex, null),
+
+    lapNumber: parseInteger(sample.lapNumber, null),
+    lapDistance: finiteNumberOrNull(sample.lapDistance),
+    totalDistance: finiteNumberOrNull(sample.totalDistance),
+
+    worldX,
+    worldY,
+    worldZ,
+
+    yaw: finiteNumberOrNull(sample.yaw),
+    pitch: finiteNumberOrNull(sample.pitch),
+    roll: finiteNumberOrNull(sample.roll),
+
+    speedKph: finiteNumberOrNull(sample.speedKph),
+    throttle: finiteNumberOrNull(sample.throttle),
+    brake: finiteNumberOrNull(sample.brake),
+    steering: finiteNumberOrNull(sample.steering),
+
+    trackId: parseInteger(sample.trackId, null),
+    trackName: safeString(sample.trackName, null),
+  };
+}
+
+function makeBoundsFromPoint(point) {
+  if (!point) return null;
+
+  const bounds = {
+    minX: point.worldX,
+    maxX: point.worldX,
+    minZ: point.worldZ,
+    maxZ: point.worldZ,
+  };
+
+  if (point.worldY !== null) {
+    bounds.minY = point.worldY;
+    bounds.maxY = point.worldY;
+  }
+
+  return withBoundDimensions(bounds);
+}
+
+function withBoundDimensions(bounds) {
+  if (!bounds) return null;
+
+  const minX = finiteNumberOrNull(bounds.minX);
+  const maxX = finiteNumberOrNull(bounds.maxX);
+  const minZ = finiteNumberOrNull(bounds.minZ);
+  const maxZ = finiteNumberOrNull(bounds.maxZ);
+
+  if (minX === null || maxX === null || minZ === null || maxZ === null) return null;
+
+  const out = {
+    minX,
+    maxX,
+    minZ,
+    maxZ,
+    widthMeters: maxX - minX,
+    heightMeters: maxZ - minZ,
+  };
+
+  const minY = finiteNumberOrNull(bounds.minY);
+  const maxY = finiteNumberOrNull(bounds.maxY);
+  if (minY !== null && maxY !== null) {
+    out.minY = minY;
+    out.maxY = maxY;
+    out.elevationRangeMeters = maxY - minY;
+  }
+
+  return out;
+}
+
+function mergeBounds(existing, incoming) {
+  const a = withBoundDimensions(existing);
+  const b = withBoundDimensions(incoming);
+
+  if (!a) return b;
+  if (!b) return a;
+
+  const merged = {
+    minX: Math.min(a.minX, b.minX),
+    maxX: Math.max(a.maxX, b.maxX),
+    minZ: Math.min(a.minZ, b.minZ),
+    maxZ: Math.max(a.maxZ, b.maxZ),
+  };
+
+  const aMinY = finiteNumberOrNull(a.minY);
+  const aMaxY = finiteNumberOrNull(a.maxY);
+  const bMinY = finiteNumberOrNull(b.minY);
+  const bMaxY = finiteNumberOrNull(b.maxY);
+  if (aMinY !== null || bMinY !== null) {
+    merged.minY = Math.min(aMinY ?? bMinY, bMinY ?? aMinY);
+    merged.maxY = Math.max(aMaxY ?? bMaxY, bMaxY ?? aMaxY);
+  }
+
+  return withBoundDimensions(merged);
+}
+
+function boundsFromPoints(points) {
+  let bounds = null;
+  for (const point of points) {
+    bounds = mergeBounds(bounds, makeBoundsFromPoint(point));
+  }
+  return bounds;
+}
+
+function buildLatestMapPosition(sample) {
+  const point = extractMapPoint(sample);
+  if (!point) return null;
+
+  return {
+    worldX: point.worldX,
+    worldY: point.worldY,
+    worldZ: point.worldZ,
+    yaw: point.yaw,
+    pitch: point.pitch,
+    roll: point.roll,
+    lapDistance: point.lapDistance,
+    totalDistance: point.totalDistance,
+    lapNumber: point.lapNumber,
+    speedKph: point.speedKph,
+    throttle: point.throttle,
+    brake: point.brake,
+    steering: point.steering,
+    timestamp: point.timestamp,
+    sampleIndex: point.sampleIndex,
+  };
+}
+
+function buildMapStats(samples) {
+  const points = [];
+  let maxSpeed = 0;
+  let longestBrakingZoneMeters = 0;
+  let currentLapNumber = null;
+
+  for (const raw of samples) {
+    const speedKph = finiteNumberOrNull(raw?.speedKph);
+    if (speedKph !== null && speedKph > maxSpeed) {
+      maxSpeed = speedKph;
+    }
+
+    const brakingDistance = finiteNumberOrNull(raw?.brakingDistance);
+    if (brakingDistance !== null && brakingDistance > longestBrakingZoneMeters) {
+      longestBrakingZoneMeters = brakingDistance;
+    }
+
+    const lapNumber = parseInteger(raw?.lapNumber, null);
+    if (lapNumber !== null) {
+      currentLapNumber = lapNumber;
+    }
+
+    const point = extractMapPoint(raw);
+    if (point) points.push(point);
+  }
+
+  return {
+    totalSamples: samples.length,
+    maxSpeed,
+    longestBrakingZoneMeters,
+    currentLapNumber,
+    mapPointCount: points.length,
+    bounds: boundsFromPoints(points),
+    latestMapPosition: points.length ? buildLatestMapPosition(points[points.length - 1]) : null,
+    mapPreviewPoints: downsamplePoints(points, 150).map(pointToSmallMapPoint),
+  };
+}
+
+function pointToSmallMapPoint(point) {
+  return {
+    t: point.timestamp,
+    i: point.sampleIndex,
+    lap: point.lapNumber,
+    d: point.lapDistance,
+    x: point.worldX,
+    y: point.worldY,
+    z: point.worldZ,
+    v: point.speedKph,
+    br: point.brake,
+    th: point.throttle,
+    st: point.steering,
+  };
+}
+
+function downsamplePoints(points, maxPoints = 500) {
+  if (!Array.isArray(points) || points.length <= maxPoints) return points;
+  const out = [];
+  const step = (points.length - 1) / (maxPoints - 1);
+
+  for (let i = 0; i < maxPoints; i += 1) {
+    out.push(points[Math.round(i * step)]);
+  }
+
+  return out;
 }
 
 function mergeProcessedSummary(existing = {}, incoming = {}, latestLap = null) {
@@ -154,6 +407,25 @@ function mergeProcessedSummary(existing = {}, incoming = {}, latestLap = null) {
   }
 
   return out;
+}
+
+function mergeMapSummary(existing = {}, stats = {}, latestMapPosition = null, sessionData = {}) {
+  const existingCount = parseInteger(existing.sampleCount, 0) || 0;
+  const incomingCount = parseInteger(stats.mapPointCount, 0) || 0;
+
+  const bounds = mergeBounds(existing.worldBounds, stats.bounds);
+  const trackId = parseInteger(sessionData.trackId ?? existing.trackId, null);
+  const trackName = safeString(sessionData.trackName ?? existing.trackName, null);
+
+  return stripUndefinedDeep({
+    hasWorldPosition: incomingCount > 0 || existing.hasWorldPosition === true,
+    sampleCount: existingCount + incomingCount,
+    worldBounds: bounds,
+    latestMapPosition: latestMapPosition ?? existing.latestMapPosition ?? null,
+    trackId,
+    trackName,
+    trackKey: trackKeyFrom(trackId, trackName),
+  });
 }
 
 async function ensureUserRecord({ username, email = null }) {
@@ -240,7 +512,107 @@ async function applySessionSummary(sessionRef, patch, latestLap = null) {
     processedSummary: mergedSummary,
   };
 
-  await sessionRef.set(updateBody, { merge: true });
+  await sessionRef.set(stripUndefinedDeep(updateBody), { merge: true });
+}
+
+async function mergeGlobalTrackMap(sessionData, stats, latestMapPosition) {
+  if (!stats || stats.mapPointCount <= 0 || !stats.bounds) return null;
+
+  const trackId = parseInteger(sessionData.trackId, null);
+  const trackName = safeString(sessionData.trackName, null);
+  const trackKey = trackKeyFrom(trackId, trackName);
+  const ref = db.collection("trackMaps").doc(trackKey);
+  const snap = await ref.get();
+  const existing = snap.exists ? snap.data() || {} : {};
+
+  const mergedBounds = mergeBounds(existing.worldBounds, stats.bounds);
+  const existingCount = parseInteger(existing.sampleCount, 0) || 0;
+
+  const updateBody = {
+    trackKey,
+    trackId,
+    trackName,
+    worldBounds: mergedBounds,
+    sampleCount: existingCount + stats.mapPointCount,
+    latestMapPosition: latestMapPosition ?? existing.latestMapPosition ?? null,
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+
+  if (!snap.exists) {
+    updateBody.createdAt = FieldValue.serverTimestamp();
+  }
+
+  await ref.set(stripUndefinedDeep(updateBody), { merge: true });
+  return trackKey;
+}
+
+function sortMapPoints(points) {
+  return [...points].sort((a, b) => {
+    const aLap = parseInteger(a.lapNumber, 0) || 0;
+    const bLap = parseInteger(b.lapNumber, 0) || 0;
+    if (aLap !== bLap) return aLap - bLap;
+
+    const aDist = finiteNumberOrNull(a.lapDistance);
+    const bDist = finiteNumberOrNull(b.lapDistance);
+    if (aDist !== null && bDist !== null && aDist !== bDist) return aDist - bDist;
+
+    const ai = parseInteger(a.sampleIndex, 0) || 0;
+    const bi = parseInteger(b.sampleIndex, 0) || 0;
+    return ai - bi;
+  });
+}
+
+async function collectSessionMapPoints(sessionRef) {
+  const chunksSnap = await sessionRef.collection("telemetryChunks").get();
+  const points = [];
+
+  for (const doc of chunksSnap.docs) {
+    const data = doc.data() || {};
+    const samples = Array.isArray(data.samples) ? data.samples : [];
+
+    for (const sample of samples) {
+      const point = extractMapPoint(sample);
+      if (point) points.push(point);
+    }
+  }
+
+  return sortMapPoints(points);
+}
+
+async function saveCenterlineChunks(trackKey, points, version, chunkSize = 400) {
+  const ref = db.collection("trackMaps").doc(trackKey);
+  const batchLimit = 400;
+  let batch = db.batch();
+  let writes = 0;
+  let chunkIndex = 0;
+
+  for (let i = 0; i < points.length; i += chunkSize) {
+    const chunkPoints = points.slice(i, i + chunkSize).map(pointToSmallMapPoint);
+    const chunkRef = ref.collection("centerlineChunks").doc(`v${version}_chunk_${String(chunkIndex).padStart(3, "0")}`);
+
+    batch.set(chunkRef, {
+      version,
+      chunkIndex,
+      count: chunkPoints.length,
+      points: chunkPoints,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    writes += 1;
+    chunkIndex += 1;
+
+    if (writes >= batchLimit) {
+      await batch.commit();
+      batch = db.batch();
+      writes = 0;
+    }
+  }
+
+  if (writes > 0) {
+    await batch.commit();
+  }
+
+  return chunkIndex;
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -362,19 +734,22 @@ app.post("/sessions", async (req, res) => {
     const trackName = safeString(req.body.trackName, null);
     const trackId = parseInteger(req.body.trackId, null);
     const sessionType = parseInteger(req.body.sessionType, null);
+    const trackKey = trackKeyFrom(trackId, trackName);
 
     const sessionRef = db.collection("sessions").doc();
-    await sessionRef.set({
+    await sessionRef.set(stripUndefinedDeep({
       userId: user.id,
       username: user.username,
       email: user.email ?? null,
       trackName,
       trackId,
+      trackKey,
       sessionType,
       startedAt: FieldValue.serverTimestamp(),
       endedAt: null,
       latestTelemetry: null,
       latestTelemetryAt: null,
+      latestMapPosition: null,
       processedSummary: {
         totalSamples: 0,
         totalLaps: 0,
@@ -385,7 +760,16 @@ app.post("/sessions", async (req, res) => {
         bestLapTimeMs: null,
         lastLapTimeMs: null,
       },
-    });
+      mapSummary: {
+        hasWorldPosition: false,
+        sampleCount: 0,
+        worldBounds: null,
+        latestMapPosition: null,
+        trackId,
+        trackName,
+        trackKey,
+      },
+    }));
 
     const saved = await sessionRef.get();
     res.status(201).json(serializeDoc(saved));
@@ -405,6 +789,7 @@ app.patch("/sessions/:id", async (req, res) => {
       return res.status(404).json({ error: "session not found" });
     }
 
+    const current = sessionSnap.data() || {};
     const updateBody = {};
     if (req.body.trackId !== undefined)
       updateBody.trackId = parseInteger(req.body.trackId, null);
@@ -415,7 +800,11 @@ app.patch("/sessions/:id", async (req, res) => {
     if (req.body.playerName !== undefined)
       updateBody.playerName = safeString(req.body.playerName, null);
 
-    await sessionRef.set(updateBody, { merge: true });
+    const nextTrackId = updateBody.trackId ?? current.trackId ?? null;
+    const nextTrackName = updateBody.trackName ?? current.trackName ?? null;
+    updateBody.trackKey = trackKeyFrom(nextTrackId, nextTrackName);
+
+    await sessionRef.set(stripUndefinedDeep(updateBody), { merge: true });
 
     const updated = await sessionRef.get();
     res.json(serializeDoc(updated));
@@ -475,7 +864,7 @@ app.post("/sessions/:id/laps", async (req, res) => {
         ? Math.max(0, lapTimeMs - sector1Ms - sector2Ms)
         : null);
 
-    const lapData = {
+    const lapData = stripUndefinedDeep({
       lapNumber,
       lapTimeMs,
       sector1Ms,
@@ -485,7 +874,7 @@ app.post("/sessions/:id/laps", async (req, res) => {
       trackName,
       trackId,
       recordedAt: FieldValue.serverTimestamp(),
-    };
+    });
 
     await lapRef.set(lapData);
 
@@ -544,7 +933,7 @@ app.post("/sessions/:id/corners", async (req, res) => {
 
     const cornerRef = sessionRef.collection("corners").doc();
 
-    await cornerRef.set({
+    await cornerRef.set(stripUndefinedDeep({
       cornerIndex: parseInteger(req.body.cornerIndex, null),
       trackId: parseInteger(req.body.trackId, null),
       trackName: safeString(req.body.trackName, null),
@@ -564,12 +953,29 @@ app.post("/sessions/:id/corners", async (req, res) => {
 
       startSpeedKph: parseNumber(req.body.startSpeedKph, null),
       endSpeedKph: parseNumber(req.body.endSpeedKph, null),
+      minSpeedKph: parseNumber(req.body.minSpeedKph, null),
+      maxBrake: parseNumber(req.body.maxBrake, null),
+      maxThrottle: parseNumber(req.body.maxThrottle, null),
 
       maxAbsSteering: parseNumber(req.body.maxAbsSteering, null),
+      sampleCount: parseInteger(req.body.sampleCount, null),
+
+      startWorldX: parseNumber(req.body.startWorldX, null),
+      startWorldY: parseNumber(req.body.startWorldY, null),
+      startWorldZ: parseNumber(req.body.startWorldZ, null),
+      endWorldX: parseNumber(req.body.endWorldX, null),
+      endWorldY: parseNumber(req.body.endWorldY, null),
+      endWorldZ: parseNumber(req.body.endWorldZ, null),
+
+      apexLapDistanceM: parseNumber(req.body.apexLapDistanceM, null),
+      apexWorldX: parseNumber(req.body.apexWorldX, null),
+      apexWorldY: parseNumber(req.body.apexWorldY, null),
+      apexWorldZ: parseNumber(req.body.apexWorldZ, null),
+
       endReason: safeString(req.body.endReason, null),
 
       createdAt: FieldValue.serverTimestamp(),
-    });
+    }));
 
     const saved = await cornerRef.get();
     res.status(201).json(serializeDoc(saved));
@@ -596,15 +1002,22 @@ app.post("/telemetry/latest", async (req, res) => {
       return res.status(404).json({ error: "session not found" });
     }
 
-    await sessionRef.set(
-      {
-        latestTelemetry,
-        latestTelemetryAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    const latestMapPosition = buildLatestMapPosition(latestTelemetry);
 
-    res.json({ success: true });
+    const updateBody = {
+      latestTelemetry,
+      latestTelemetryAt: FieldValue.serverTimestamp(),
+    };
+
+    if (latestMapPosition) {
+      updateBody.latestMapPosition = latestMapPosition;
+      updateBody["mapSummary.latestMapPosition"] = latestMapPosition;
+      updateBody["mapSummary.hasWorldPosition"] = true;
+    }
+
+    await sessionRef.set(stripUndefinedDeep(updateBody), { merge: true });
+
+    res.json({ success: true, hasMapPosition: !!latestMapPosition });
   } catch (err) {
     console.error("POST /telemetry/latest error:", err);
     res.status(500).json({ error: "failed to update latest telemetry" });
@@ -627,62 +1040,274 @@ app.post("/telemetry/batch", async (req, res) => {
       return res.status(404).json({ error: "session not found" });
     }
 
-    const chunkRef = sessionRef.collection("telemetryChunks").doc();
+    const sessionData = sessionSnap.data() || {};
+    const stats = buildMapStats(samples);
     const latestTelemetry = samples[samples.length - 1];
+    const latestMapPosition = stats.latestMapPosition ?? buildLatestMapPosition(latestTelemetry);
 
-    let maxSpeed = 0;
-    let longestBrakingZoneMeters = 0;
-    let currentLapNumber = null;
+    const chunkRef = sessionRef.collection("telemetryChunks").doc();
 
-    for (const s of samples) {
-      if (s?.speedKph != null && s.speedKph > maxSpeed) {
-        maxSpeed = s.speedKph;
-      }
-      if (s?.brakingDistance != null && s.brakingDistance > longestBrakingZoneMeters) {
-        longestBrakingZoneMeters = s.brakingDistance;
-      }
-      if (s?.lapNumber != null) {
-        currentLapNumber = s.lapNumber;
-      }
-    }
-
-    await chunkRef.set({
+    await chunkRef.set(stripUndefinedDeep({
       samples,
       count: samples.length,
+      mapPointCount: stats.mapPointCount,
+      mapBounds: stats.bounds,
+      mapPreviewPoints: stats.mapPreviewPoints,
       receivedAt: FieldValue.serverTimestamp(),
+    }));
+
+    const currentSummary = sessionData.processedSummary || {};
+    const mergedSummary = mergeProcessedSummary(currentSummary, {
+      totalSamples: samples.length,
+      topSpeedKph: stats.maxSpeed,
+      longestBrakingZoneMeters: stats.longestBrakingZoneMeters,
+      currentLapNumber: stats.currentLapNumber,
     });
 
-    const currentSummary = sessionSnap.data()?.processedSummary || {};
-
-    const mergedSummary = {
-      totalSamples: (parseInteger(currentSummary.totalSamples, 0) || 0) + samples.length,
-      totalLaps: currentSummary.totalLaps || 0,
-      topSpeedKph: Math.max(parseNumber(currentSummary.topSpeedKph, 0) || 0, maxSpeed),
-      longestBrakingZoneMeters: Math.max(
-        parseNumber(currentSummary.longestBrakingZoneMeters, 0) || 0,
-        longestBrakingZoneMeters
-      ),
-      fastestLap: currentSummary.fastestLap ?? null,
-      currentLapNumber: currentLapNumber ?? currentSummary.currentLapNumber ?? null,
-      bestLapTimeMs: currentSummary.bestLapTimeMs ?? null,
-      lastLapTimeMs: currentSummary.lastLapTimeMs ?? null,
-    };
+    const mergedMapSummary = mergeMapSummary(
+      sessionData.mapSummary || {},
+      stats,
+      latestMapPosition,
+      sessionData
+    );
 
     await sessionRef.set(
-      {
+      stripUndefinedDeep({
         latestTelemetry,
         latestTelemetryAt: FieldValue.serverTimestamp(),
+        latestMapPosition: latestMapPosition ?? sessionData.latestMapPosition ?? null,
         processedSummary: mergedSummary,
-      },
+        mapSummary: mergedMapSummary,
+      }),
       { merge: true }
     );
 
-    res.status(201).json({ success: true, count: samples.length });
+    const trackKey = await mergeGlobalTrackMap(sessionData, stats, latestMapPosition);
+
+    res.status(201).json({
+      success: true,
+      count: samples.length,
+      mapPointCount: stats.mapPointCount,
+      trackKey,
+      mapBounds: stats.bounds,
+    });
   } catch (err) {
     console.error("POST /telemetry/batch error:", err);
     res.status(500).json({ error: "failed to save telemetry batch" });
   }
 });
+
+app.post("/sessions/:id/track-map/finalize", async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
+    const maxPoints = parseInteger(req.body.maxPoints, 800) || 800;
+
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
+    const sessionData = sessionSnap.data() || {};
+    const points = await collectSessionMapPoints(sessionRef);
+
+    if (points.length === 0) {
+      return res.status(400).json({
+        error: "no world position samples found for this session",
+        hint: "Make sure the listener is receiving Motion packet 0 and sending worldX/worldZ.",
+      });
+    }
+
+    const bounds = boundsFromPoints(points);
+    const centerline = downsamplePoints(points, maxPoints);
+    const trackId = parseInteger(sessionData.trackId, null);
+    const trackName = safeString(sessionData.trackName, null);
+    const trackKey = trackKeyFrom(trackId, trackName);
+    const version = Date.now();
+
+    const trackMap = stripUndefinedDeep({
+      trackKey,
+      trackId,
+      trackName,
+      sourceSessionId: sessionId,
+      worldBounds: bounds,
+      sourceSampleCount: points.length,
+      centerlinePointCount: centerline.length,
+      centerlineVersion: version,
+      finalizedAt: FieldValue.serverTimestamp(),
+    });
+
+    await sessionRef.set(
+      {
+        trackMap,
+        mapSummary: mergeMapSummary(sessionData.mapSummary || {}, {
+          mapPointCount: points.length,
+          bounds,
+        }, buildLatestMapPosition(points[points.length - 1]), sessionData),
+      },
+      { merge: true }
+    );
+
+    const trackRef = db.collection("trackMaps").doc(trackKey);
+    const existingTrackSnap = await trackRef.get();
+    const existingTrack = existingTrackSnap.exists ? existingTrackSnap.data() || {} : {};
+
+    await trackRef.set(
+      stripUndefinedDeep({
+        trackKey,
+        trackId,
+        trackName,
+        worldBounds: mergeBounds(existingTrack.worldBounds, bounds),
+        sourceSessionId: sessionId,
+        sourceSampleCount: points.length,
+        centerlinePointCount: centerline.length,
+        centerlineVersion: version,
+        updatedAt: FieldValue.serverTimestamp(),
+        finalizedAt: FieldValue.serverTimestamp(),
+        createdAt: existingTrackSnap.exists ? existingTrack.createdAt : FieldValue.serverTimestamp(),
+      }),
+      { merge: true }
+    );
+
+    const chunkCount = await saveCenterlineChunks(trackKey, centerline, version);
+
+    res.status(201).json({
+      success: true,
+      sessionId,
+      trackKey,
+      worldBounds: bounds,
+      sourceSampleCount: points.length,
+      centerlinePointCount: centerline.length,
+      centerlineChunkCount: chunkCount,
+      centerlineVersion: version,
+    });
+  } catch (err) {
+    console.error("POST /sessions/:id/track-map/finalize error:", err);
+    res.status(500).json({ error: "failed to finalize track map" });
+  }
+});
+
+app.get("/sessions/:id/track-map", async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
+    const data = sessionSnap.data() || {};
+    res.json({
+      sessionId,
+      trackKey: data.trackKey ?? data.mapSummary?.trackKey ?? null,
+      latestMapPosition: data.latestMapPosition ?? null,
+      mapSummary: data.mapSummary ?? null,
+      trackMap: data.trackMap ?? null,
+    });
+  } catch (err) {
+    console.error("GET /sessions/:id/track-map error:", err);
+    res.status(500).json({ error: "failed to fetch session track map" });
+  }
+});
+
+app.get("/track-maps/:trackKey", async (req, res) => {
+  try {
+    const trackKey = safeString(req.params.trackKey);
+    if (!trackKey) return res.status(400).json({ error: "trackKey is required" });
+
+    const trackRef = db.collection("trackMaps").doc(trackKey);
+    const snap = await trackRef.get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: "track map not found" });
+    }
+
+    const trackMap = serializeDoc(snap);
+    const includeCenterline = parseBoolean(req.query.includeCenterline, false);
+
+    if (!includeCenterline) {
+      return res.json(trackMap);
+    }
+
+    const version = parseInteger(req.query.version, trackMap.centerlineVersion ?? null);
+
+    // Fetch and sort in app code to avoid requiring a Firestore composite index.
+    const chunksSnap = await trackRef.collection("centerlineChunks").get();
+    const chunkDocs = chunksSnap.docs
+      .map((doc) => doc.data() || {})
+      .filter((data) => version === null || parseInteger(data.version, null) === version)
+      .sort((a, b) => (parseInteger(a.chunkIndex, 0) || 0) - (parseInteger(b.chunkIndex, 0) || 0));
+
+    const centerline = [];
+    for (const data of chunkDocs) {
+      if (Array.isArray(data.points)) centerline.push(...data.points);
+    }
+
+    res.json({
+      ...trackMap,
+      centerline,
+    });
+  } catch (err) {
+    console.error("GET /track-maps/:trackKey error:", err);
+    res.status(500).json({ error: "failed to fetch track map" });
+  }
+});
+
+app.patch("/track-maps/:trackKey/calibration", async (req, res) => {
+  try {
+    const trackKey = safeString(req.params.trackKey);
+    if (!trackKey) return res.status(400).json({ error: "trackKey is required" });
+
+    const imageWidth = parseNumber(req.body.imageWidth, null);
+    const imageHeight = parseNumber(req.body.imageHeight, null);
+    const imageUrl = safeString(req.body.imageUrl, null);
+
+    const anchorPoints = Array.isArray(req.body.anchorPoints)
+      ? req.body.anchorPoints
+          .map((p) => ({
+            label: safeString(p.label, null),
+            worldX: parseNumber(p.worldX, null),
+            worldZ: parseNumber(p.worldZ, null),
+            imageX: parseNumber(p.imageX, null),
+            imageY: parseNumber(p.imageY, null),
+          }))
+          .filter(
+            (p) =>
+              p.worldX !== null &&
+              p.worldZ !== null &&
+              p.imageX !== null &&
+              p.imageY !== null
+          )
+      : [];
+
+    const calibration = stripUndefinedDeep({
+      imageUrl,
+      imageWidth,
+      imageHeight,
+      anchorPoints,
+      note:
+        "Use anchorPoints to transform worldX/worldZ into imageX/imageY on the frontend.",
+      calibratedAt: FieldValue.serverTimestamp(),
+    });
+
+    const ref = db.collection("trackMaps").doc(trackKey);
+    await ref.set(
+      {
+        imageCalibration: calibration,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    const saved = await ref.get();
+    res.json(serializeDoc(saved));
+  } catch (err) {
+    console.error("PATCH /track-maps/:trackKey/calibration error:", err);
+    res.status(500).json({ error: "failed to save calibration" });
+  }
+});
+
 app.get("/schema", (req, res) => {
   res.json({
     collections: [
@@ -692,9 +1317,24 @@ app.get("/schema", (req, res) => {
       "sessions/{sessionId}/telemetryChunks",
       "sessions/{sessionId}/laps",
       "sessions/{sessionId}/corners",
+      "trackMaps",
+      "trackMaps/{trackKey}/centerlineChunks",
     ],
+    importantSessionFields: {
+      latestTelemetry: "Latest raw telemetry sample, including worldX/worldY/worldZ.",
+      latestMapPosition: "Small map-ready current car position.",
+      mapSummary: "Session-level world bounds and map sample count.",
+      trackMap: "Finalized map generated from a calibration/session recording.",
+    },
+    importantTrackMapFields: {
+      worldBounds: "min/max world X/Z and calculated width/height in game metres.",
+      imageCalibration:
+        "Optional image size and anchor points used to align world coordinates to a track image.",
+      centerlineChunks:
+        "Downsampled points for drawing the track path without overloading one Firestore document.",
+    },
     strategy:
-      "Users are the identity root. Sessions reference userId and store telemetry + summary.",
+      "Sessions store driving data. trackMaps store reusable circuit calibration data for map overlays.",
   });
 });
 
