@@ -1,14 +1,3 @@
-// backend_with_map.js
-// Drop-in replacement for your Express/Firebase backend.
-// Keeps your existing user/session/lap/corner/telemetry routes.
-// Adds map-ready storage:
-//   - latestTelemetry.worldX/worldY/worldZ
-//   - sessions/{sessionId}.latestMapPosition
-//   - sessions/{sessionId}.mapSummary
-//   - sessions/{sessionId}/telemetryChunks/{chunkId}.mapBounds
-//   - trackMaps/{trackKey}
-//   - trackMaps/{trackKey}/centerlineChunks/{chunkId}
-
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
