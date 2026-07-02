@@ -3,6 +3,8 @@ import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 import dotenv from "dotenv";
+import bcrypt from "bcryptjs";
+import crypto from "crypto";
 
 import { initializeApp, applicationDefault, cert } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
@@ -11,6 +13,9 @@ dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3001;
+const PASSWORD_MIN_LENGTH = 8;
+const BCRYPT_SALT_ROUNDS = Number(process.env.BCRYPT_SALT_ROUNDS || 12);
+const AUTH_SESSION_DAYS = Number(process.env.AUTH_SESSION_DAYS || 7);
 
 let credential;
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -104,6 +109,7 @@ function serializeDoc(docSnap) {
     "calibratedAt",
     "finalizedAt",
     "createdFromSessionAt",
+    "expiresAt",
   ]) {
     if (out[key] && typeof out[key].toDate === "function") {
       out[key] = out[key].toDate().toISOString();
@@ -417,6 +423,151 @@ function mergeMapSummary(existing = {}, stats = {}, latestMapPosition = null, se
   });
 }
 
+function toPublicUser(user) {
+  const { passwordHash, ...safe } = user || {};
+  const isAdmin = safe.role === "admin" || safe.isAdmin === true;
+
+  return {
+    ...safe,
+    role: isAdmin ? "admin" : safe.role || "user",
+    isAdmin,
+  };
+}
+
+function authTokenHash(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function getAuthSessionExpiry() {
+  return new Date(Date.now() + AUTH_SESSION_DAYS * 24 * 60 * 60 * 1000);
+}
+
+function asDate(value) {
+  if (!value) return null;
+  if (typeof value.toDate === "function") return value.toDate();
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+async function createAuthSession(userId) {
+  const token = crypto.randomBytes(32).toString("hex");
+  const tokenHash = authTokenHash(token);
+
+  await db.collection("authSessions").doc(tokenHash).set({
+    userId,
+    createdAt: FieldValue.serverTimestamp(),
+    expiresAt: getAuthSessionExpiry(),
+  });
+
+  return token;
+}
+
+async function findUserByIdentifier(identifier) {
+  const value = safeString(identifier, null);
+  if (!value) return null;
+
+  const emailLower = normalizeEmail(value);
+  const usernameLower = normalizeUsername(value);
+  const lookups = [];
+
+  if (emailLower && value.includes("@")) {
+    lookups.push({ collection: "emails", key: emailLower });
+  }
+
+  if (usernameLower) {
+    lookups.push({ collection: "usernames", key: usernameLower });
+  }
+
+  for (const lookup of lookups) {
+    const mapSnap = await db.collection(lookup.collection).doc(lookup.key).get();
+    if (!mapSnap.exists) continue;
+
+    const { userId } = mapSnap.data() || {};
+    if (!userId) continue;
+
+    const userRef = db.collection("users").doc(userId);
+    const userSnap = await userRef.get();
+    if (userSnap.exists) {
+      return {
+        id: userSnap.id,
+        ref: userRef,
+        data: userSnap.data() || {},
+      };
+    }
+  }
+
+  if (emailLower) {
+    const snap = await db
+      .collection("users")
+      .where("emailLower", "==", emailLower)
+      .limit(1)
+      .get();
+
+    if (!snap.empty) {
+      const userSnap = snap.docs[0];
+      return {
+        id: userSnap.id,
+        ref: userSnap.ref,
+        data: userSnap.data() || {},
+      };
+    }
+  }
+
+  return null;
+}
+
+async function authenticate(req, res, next) {
+  try {
+    const authorization = req.get("authorization") || "";
+    const token = authorization.toLowerCase().startsWith("bearer ")
+      ? authorization.slice(7).trim()
+      : null;
+
+    if (!token) {
+      return res.status(401).json({ error: "login required" });
+    }
+
+    const sessionRef = db.collection("authSessions").doc(authTokenHash(token));
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(401).json({ error: "invalid login session" });
+    }
+
+    const session = sessionSnap.data() || {};
+    const expiresAt = asDate(session.expiresAt);
+
+    if (!session.userId || !expiresAt || expiresAt <= new Date()) {
+      await sessionRef.delete().catch(() => {});
+      return res.status(401).json({ error: "login session expired" });
+    }
+
+    const userRef = db.collection("users").doc(session.userId);
+    const userSnap = await userRef.get();
+
+    if (!userSnap.exists) {
+      return res.status(401).json({ error: "user no longer exists" });
+    }
+
+    req.authSessionRef = sessionRef;
+    req.userRef = userRef;
+    req.user = toPublicUser({ id: userSnap.id, ...(userSnap.data() || {}) });
+    next();
+  } catch (err) {
+    console.error("Auth middleware error:", err);
+    res.status(500).json({ error: "failed to verify login session" });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.user?.isAdmin) {
+    return res.status(403).json({ error: "admin access required" });
+  }
+
+  next();
+}
+
 async function ensureUserRecord({ username, email = null }) {
   const cleanUsername = safeString(username);
   if (!cleanUsername) throw new Error("username is required");
@@ -426,9 +577,11 @@ async function ensureUserRecord({ username, email = null }) {
   const emailLower = normalizeEmail(emailValue);
 
   const usernameRef = db.collection("usernames").doc(usernameLower);
+  const emailRef = emailLower ? db.collection("emails").doc(emailLower) : null;
 
   return await db.runTransaction(async (tx) => {
     const mapSnap = await tx.get(usernameRef);
+    const emailSnap = emailRef ? await tx.get(emailRef) : null;
 
     if (mapSnap.exists) {
       const { userId } = mapSnap.data();
@@ -439,9 +592,15 @@ async function ensureUserRecord({ username, email = null }) {
         throw new Error("username mapping is broken");
       }
 
+      if (emailSnap?.exists && emailSnap.data()?.userId !== userId) {
+        throw new Error("email is already in use");
+      }
+
+      const current = userSnap.data() || {};
       const updateBody = {
         username: cleanUsername,
         usernameLower,
+        role: current.role || (current.isAdmin ? "admin" : "user"),
         lastSeenAt: FieldValue.serverTimestamp(),
       };
 
@@ -452,12 +611,29 @@ async function ensureUserRecord({ username, email = null }) {
 
       tx.set(userRef, updateBody, { merge: true });
 
-      const current = userSnap.data() || {};
-      return {
+      if (emailRef) {
+        const emailMap = {
+          userId,
+          emailLower,
+          updatedAt: FieldValue.serverTimestamp(),
+        };
+
+        if (!emailSnap?.exists) {
+          emailMap.createdAt = FieldValue.serverTimestamp();
+        }
+
+        tx.set(emailRef, emailMap, { merge: true });
+      }
+
+      return toPublicUser({
         id: userId,
         ...current,
         ...updateBody,
-      };
+      });
+    }
+
+    if (emailSnap?.exists) {
+      throw new Error("email is already in use");
     }
 
     const userRef = db.collection("users").doc();
@@ -466,6 +642,8 @@ async function ensureUserRecord({ username, email = null }) {
       usernameLower,
       email: emailValue,
       emailLower,
+      role: "user",
+      isAdmin: false,
       createdAt: FieldValue.serverTimestamp(),
       lastSeenAt: FieldValue.serverTimestamp(),
     };
@@ -477,11 +655,149 @@ async function ensureUserRecord({ username, email = null }) {
       createdAt: FieldValue.serverTimestamp(),
     });
 
-    return {
+    if (emailRef) {
+      tx.set(emailRef, {
+        userId: userRef.id,
+        emailLower,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+    }
+
+    return toPublicUser({
       id: userRef.id,
       ...userData,
-    };
+    });
   });
+}
+
+async function createAccount({ username, email, password }) {
+  const cleanUsername = safeString(username);
+  const emailValue = safeString(email, null);
+  const emailLower = normalizeEmail(emailValue);
+
+  if (!cleanUsername) throw new Error("name is required");
+  if (!emailLower) throw new Error("valid email is required");
+  if (!password || String(password).length < PASSWORD_MIN_LENGTH) {
+    throw new Error(`password must be at least ${PASSWORD_MIN_LENGTH} characters`);
+  }
+
+  const usernameLower = normalizeUsername(cleanUsername);
+  const existingEmailUser = await findUserByIdentifier(emailLower);
+
+  if (existingEmailUser && existingEmailUser.data.usernameLower !== usernameLower) {
+    throw new Error("email is already in use");
+  }
+
+  const usernameRef = db.collection("usernames").doc(usernameLower);
+  const emailRef = db.collection("emails").doc(emailLower);
+  const passwordHash = await bcrypt.hash(String(password), BCRYPT_SALT_ROUNDS);
+
+  return await db.runTransaction(async (tx) => {
+    const usernameSnap = await tx.get(usernameRef);
+    const emailSnap = await tx.get(emailRef);
+
+    if (usernameSnap.exists) {
+      const { userId } = usernameSnap.data() || {};
+      const userRef = db.collection("users").doc(userId);
+      const userSnap = await tx.get(userRef);
+
+      if (!userSnap.exists) {
+        throw new Error("username mapping is broken");
+      }
+
+      const current = userSnap.data() || {};
+
+      if (current.passwordHash) {
+        throw new Error("name is already in use");
+      }
+
+      if (emailSnap.exists && emailSnap.data()?.userId !== userId) {
+        throw new Error("email is already in use");
+      }
+
+      const updateBody = {
+        username: cleanUsername,
+        usernameLower,
+        email: emailValue,
+        emailLower,
+        passwordHash,
+        role: current.role || (current.isAdmin ? "admin" : "user"),
+        isAdmin: current.isAdmin === true || current.role === "admin",
+        lastSeenAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      tx.set(userRef, updateBody, { merge: true });
+      tx.set(emailRef, {
+        userId,
+        emailLower,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      return toPublicUser({
+        id: userId,
+        ...current,
+        ...updateBody,
+      });
+    }
+
+    if (emailSnap.exists) {
+      throw new Error("email is already in use");
+    }
+
+    const userRef = db.collection("users").doc();
+    const userData = {
+      username: cleanUsername,
+      usernameLower,
+      email: emailValue,
+      emailLower,
+      passwordHash,
+      role: "user",
+      isAdmin: false,
+      createdAt: FieldValue.serverTimestamp(),
+      lastSeenAt: FieldValue.serverTimestamp(),
+    };
+
+    tx.set(userRef, userData);
+    tx.set(usernameRef, {
+      userId: userRef.id,
+      usernameLower,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    tx.set(emailRef, {
+      userId: userRef.id,
+      emailLower,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    return toPublicUser({
+      id: userRef.id,
+      ...userData,
+    });
+  });
+}
+
+async function loginAccount({ identifier, password }) {
+  const found = await findUserByIdentifier(identifier);
+  if (!found?.data?.passwordHash) return null;
+
+  const matches = await bcrypt.compare(String(password ?? ""), found.data.passwordHash);
+  if (!matches) return null;
+
+  await found.ref.set(
+    {
+      lastSeenAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  const token = await createAuthSession(found.id);
+  const freshSnap = await found.ref.get();
+
+  return {
+    token,
+    user: toPublicUser(serializeDoc(freshSnap)),
+  };
 }
 
 async function applySessionSummary(sessionRef, patch, latestLap = null) {
@@ -606,13 +922,62 @@ async function saveCenterlineChunks(trackKey, points, version, chunkSize = 400) 
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+app.post("/auth/signup", async (req, res) => {
+  try {
+    if (req.body.password !== req.body.confirmPassword && req.body.confirmPassword !== undefined) {
+      return res.status(400).json({ error: "passwords do not match" });
+    }
+
+    const createdUser = await createAccount({
+      username: req.body.username ?? req.body.name,
+      email: req.body.email,
+      password: req.body.password,
+    });
+
+    const userSnap = await db.collection("users").doc(createdUser.id).get();
+    const user = toPublicUser(serializeDoc(userSnap));
+    const token = await createAuthSession(user.id);
+    res.status(201).json({ user, token });
+  } catch (err) {
+    console.error("POST /auth/signup error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    const result = await loginAccount({
+      identifier: req.body.identifier ?? req.body.username ?? req.body.email,
+      password: req.body.password,
+    });
+
+    if (!result) {
+      return res.status(401).json({ error: "invalid name/email or password" });
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error("POST /auth/login error:", err);
+    res.status(500).json({ error: "failed to log in" });
+  }
+});
+
+app.get("/auth/me", authenticate, async (req, res) => {
+  res.json({ user: req.user });
+});
+
+app.post("/auth/logout", authenticate, async (req, res) => {
+  await req.authSessionRef.delete();
+  res.json({ ok: true });
+});
+
 app.post("/users/ensure", async (req, res) => {
   try {
     const user = await ensureUserRecord({
       username: req.body.username,
       email: req.body.email ?? null,
     });
-    res.status(201).json(user);
+    res.status(201).json(toPublicUser(user));
   } catch (err) {
     console.error("POST /users/ensure error:", err);
     res.status(400).json({ error: err.message });
@@ -640,7 +1005,7 @@ app.get("/users/resolve", async (req, res) => {
       return res.status(404).json({ error: "user not found" });
     }
 
-    res.json(serializeDoc(userSnap));
+    res.json(toPublicUser(serializeDoc(userSnap)));
   } catch (err) {
     console.error("GET /users/resolve error:", err);
     res.status(500).json({ error: "failed to resolve user" });
@@ -653,7 +1018,7 @@ app.post("/players", async (req, res) => {
       username: req.body.name,
       email: req.body.email ?? null,
     });
-    res.status(201).json(user);
+    res.status(201).json(toPublicUser(user));
   } catch (err) {
     console.error("POST /players error:", err);
     res.status(400).json({ error: err.message });
@@ -1086,7 +1451,7 @@ app.post("/telemetry/batch", async (req, res) => {
   }
 });
 
-app.post("/sessions/:id/track-map/finalize", async (req, res) => {
+app.post("/sessions/:id/track-map/finalize", authenticate, requireAdmin, async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
     const maxPoints = parseInteger(req.body.maxPoints, 800) || 800;
@@ -1243,7 +1608,7 @@ app.get("/track-maps/:trackKey", async (req, res) => {
   }
 });
 
-app.patch("/track-maps/:trackKey/calibration", async (req, res) => {
+app.patch("/track-maps/:trackKey/calibration", authenticate, requireAdmin, async (req, res) => {
   try {
     const trackKey = safeString(req.params.trackKey);
     if (!trackKey) return res.status(400).json({ error: "trackKey is required" });
@@ -1251,6 +1616,8 @@ app.patch("/track-maps/:trackKey/calibration", async (req, res) => {
     const imageWidth = parseNumber(req.body.imageWidth, null);
     const imageHeight = parseNumber(req.body.imageHeight, null);
     const imageUrl = safeString(req.body.imageUrl, null);
+    const trackId = parseInteger(req.body.trackId, null);
+    const trackName = safeString(req.body.trackName, null);
 
     const anchorPoints = Array.isArray(req.body.anchorPoints)
       ? req.body.anchorPoints
@@ -1270,6 +1637,10 @@ app.patch("/track-maps/:trackKey/calibration", async (req, res) => {
           )
       : [];
 
+    if (anchorPoints.length < 3) {
+      return res.status(400).json({ error: "at least 3 anchor points are required" });
+    }
+
     const calibration = stripUndefinedDeep({
       imageUrl,
       imageWidth,
@@ -1282,10 +1653,13 @@ app.patch("/track-maps/:trackKey/calibration", async (req, res) => {
 
     const ref = db.collection("trackMaps").doc(trackKey);
     await ref.set(
-      {
+      stripUndefinedDeep({
+        trackKey,
+        trackId,
+        trackName,
         imageCalibration: calibration,
         updatedAt: FieldValue.serverTimestamp(),
-      },
+      }),
       { merge: true }
     );
 
@@ -1302,6 +1676,8 @@ app.get("/schema", (req, res) => {
     collections: [
       "users",
       "usernames",
+      "emails",
+      "authSessions",
       "sessions",
       "sessions/{sessionId}/telemetryChunks",
       "sessions/{sessionId}/laps",
