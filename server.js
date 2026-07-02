@@ -106,6 +106,7 @@ function serializeDoc(docSnap) {
     "latestTelemetryAt",
     "lastSeenAt",
     "lastUsedAt",
+    "suspendedAt",
     "updatedAt",
     "calibratedAt",
     "finalizedAt",
@@ -433,7 +434,12 @@ function toPublicUser(user) {
     ...safe,
     role: isAdmin ? "admin" : safe.role || "user",
     isAdmin,
+    isSuspended: safe.isSuspended === true,
   };
+}
+
+function isSuspendedUser(user) {
+  return user?.isSuspended === true || Boolean(user?.suspendedAt);
 }
 
 function authTokenHash(token) {
@@ -559,6 +565,11 @@ async function authenticate(req, res, next) {
     req.authSessionRef = sessionRef;
     req.userRef = userRef;
     req.user = toPublicUser({ id: userSnap.id, ...(userSnap.data() || {}) });
+
+    if (isSuspendedUser(req.user)) {
+      return res.status(403).json({ error: "account is suspended" });
+    }
+
     next();
   } catch (err) {
     console.error("Auth middleware error:", err);
@@ -629,6 +640,13 @@ async function resolveListenerUser(req) {
     throw err;
   }
 
+  const user = toPublicUser(serializeDoc(userSnap));
+  if (isSuspendedUser(user)) {
+    const err = new Error("account is suspended");
+    err.status = 403;
+    throw err;
+  }
+
   await tokenRef.set(
     {
       lastUsedAt: FieldValue.serverTimestamp(),
@@ -643,7 +661,7 @@ async function resolveListenerUser(req) {
     { merge: true }
   );
 
-  return toPublicUser(serializeDoc(userSnap));
+  return user;
 }
 
 function serializeListenerToken(docSnap) {
@@ -665,6 +683,40 @@ function requireAdmin(req, res, next) {
   }
 
   next();
+}
+
+async function deleteQueryInBatches(queryRef, batchSize = 400) {
+  while (true) {
+    const snap = await queryRef.limit(batchSize).get();
+    if (snap.empty) return;
+
+    const batch = db.batch();
+    for (const doc of snap.docs) {
+      batch.delete(doc.ref);
+    }
+    await batch.commit();
+
+    if (snap.size < batchSize) return;
+  }
+}
+
+async function deleteSessionWithChildren(sessionRef) {
+  for (const subcollection of ["telemetryChunks", "laps", "corners"]) {
+    await deleteQueryInBatches(sessionRef.collection(subcollection));
+  }
+
+  await sessionRef.delete();
+}
+
+async function listUserSessions(userId, max = 50) {
+  const snap = await db
+    .collection("sessions")
+    .where("userId", "==", userId)
+    .orderBy("startedAt", "desc")
+    .limit(max)
+    .get();
+
+  return snap.docs.map(serializeDoc);
 }
 
 async function ensureUserRecord({ username, email = null }) {
@@ -880,6 +932,12 @@ async function loginAccount({ identifier, password }) {
   const found = await findUserByIdentifier(identifier);
   if (!found?.data?.passwordHash) return null;
 
+  if (isSuspendedUser(found.data)) {
+    const err = new Error("account is suspended");
+    err.status = 403;
+    throw err;
+  }
+
   const matches = await bcrypt.compare(String(password ?? ""), found.data.passwordHash);
   if (!matches) return null;
 
@@ -1057,7 +1115,7 @@ app.post("/auth/login", async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error("POST /auth/login error:", err);
-    res.status(500).json({ error: "failed to log in" });
+    res.status(err.status || 500).json({ error: err.message || "failed to log in" });
   }
 });
 
@@ -1129,6 +1187,192 @@ app.delete("/listener-tokens/:tokenId", authenticate, async (req, res) => {
   }
 });
 
+app.get("/admin/users", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const snap = await db.collection("users").orderBy("createdAt", "desc").limit(200).get();
+    const users = snap.docs.map((doc) => toPublicUser(serializeDoc(doc)));
+    res.json({ users });
+  } catch (err) {
+    console.error("GET /admin/users error:", err);
+    res.status(500).json({ error: "failed to load users" });
+  }
+});
+
+app.get("/admin/users/:userId/sessions", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const userId = safeString(req.params.userId);
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const userSnap = await db.collection("users").doc(userId).get();
+    if (!userSnap.exists) return res.status(404).json({ error: "user not found" });
+
+    const sessions = await listUserSessions(userId, 100);
+    res.json({ sessions });
+  } catch (err) {
+    console.error("GET /admin/users/:userId/sessions error:", err);
+    res.status(500).json({ error: "failed to load user sessions" });
+  }
+});
+
+app.patch("/admin/users/:userId", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const userId = safeString(req.params.userId);
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const nextUsername = safeString(req.body.username, null);
+    const nextEmail = safeString(req.body.email, null);
+    const nextRole = safeString(req.body.role, null);
+    const nextSuspended = parseBoolean(req.body.isSuspended, null);
+    const suspendedReason = safeString(req.body.suspendedReason, null);
+
+    if (nextRole && !["user", "admin"].includes(nextRole)) {
+      return res.status(400).json({ error: "role must be user or admin" });
+    }
+
+    if (req.user.id === userId && nextRole === "user") {
+      return res.status(400).json({ error: "you cannot remove your own admin role" });
+    }
+
+    if (req.user.id === userId && nextSuspended === true) {
+      return res.status(400).json({ error: "you cannot suspend your own account" });
+    }
+
+    const userRef = db.collection("users").doc(userId);
+
+    await db.runTransaction(async (tx) => {
+      const userSnap = await tx.get(userRef);
+      if (!userSnap.exists) throw new Error("user not found");
+
+      const current = userSnap.data() || {};
+      const updateBody = {
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      const currentUsernameLower = current.usernameLower || normalizeUsername(current.username);
+      const currentEmailLower = current.emailLower || normalizeEmail(current.email);
+
+      if (nextUsername) {
+        const usernameLower = normalizeUsername(nextUsername);
+        if (!usernameLower) throw new Error("username is required");
+
+        if (usernameLower !== currentUsernameLower) {
+          const usernameRef = db.collection("usernames").doc(usernameLower);
+          const usernameSnap = await tx.get(usernameRef);
+
+          if (usernameSnap.exists && usernameSnap.data()?.userId !== userId) {
+            throw new Error("username is already in use");
+          }
+
+          tx.set(usernameRef, {
+            userId,
+            usernameLower,
+            updatedAt: FieldValue.serverTimestamp(),
+          }, { merge: true });
+
+          if (currentUsernameLower) {
+            tx.delete(db.collection("usernames").doc(currentUsernameLower));
+          }
+        }
+
+        updateBody.username = nextUsername;
+        updateBody.usernameLower = usernameLower;
+      }
+
+      if (nextEmail) {
+        const emailLower = normalizeEmail(nextEmail);
+        if (!emailLower) throw new Error("valid email is required");
+
+        if (emailLower !== currentEmailLower) {
+          const emailRef = db.collection("emails").doc(emailLower);
+          const emailSnap = await tx.get(emailRef);
+
+          if (emailSnap.exists && emailSnap.data()?.userId !== userId) {
+            throw new Error("email is already in use");
+          }
+
+          tx.set(emailRef, {
+            userId,
+            emailLower,
+            updatedAt: FieldValue.serverTimestamp(),
+          }, { merge: true });
+
+          if (currentEmailLower) {
+            tx.delete(db.collection("emails").doc(currentEmailLower));
+          }
+        }
+
+        updateBody.email = nextEmail;
+        updateBody.emailLower = emailLower;
+      }
+
+      if (nextRole) {
+        updateBody.role = nextRole;
+        updateBody.isAdmin = nextRole === "admin";
+      }
+
+      if (nextSuspended !== null) {
+        updateBody.isSuspended = nextSuspended;
+        updateBody.suspendedReason = nextSuspended ? suspendedReason : null;
+        updateBody.suspendedAt = nextSuspended ? FieldValue.serverTimestamp() : null;
+      }
+
+      tx.set(userRef, stripUndefinedDeep(updateBody), { merge: true });
+    });
+
+    const updated = await userRef.get();
+    res.json({ user: toPublicUser(serializeDoc(updated)) });
+  } catch (err) {
+    console.error("PATCH /admin/users/:userId error:", err);
+    const status = err.message === "user not found" ? 404 : 400;
+    res.status(status).json({ error: err.message || "failed to update user" });
+  }
+});
+
+app.delete("/admin/users/:userId/sessions", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const userId = safeString(req.params.userId);
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const sessions = await listUserSessions(userId, 500);
+    for (const session of sessions) {
+      await deleteSessionWithChildren(db.collection("sessions").doc(session.id));
+    }
+
+    res.json({ deletedCount: sessions.length });
+  } catch (err) {
+    console.error("DELETE /admin/users/:userId/sessions error:", err);
+    res.status(500).json({ error: "failed to delete user sessions" });
+  }
+});
+
+app.delete("/admin/users/:userId/sessions/:sessionId", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const userId = safeString(req.params.userId);
+    const sessionId = safeString(req.params.sessionId);
+    if (!userId || !sessionId) {
+      return res.status(400).json({ error: "userId and sessionId are required" });
+    }
+
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
+    const session = sessionSnap.data() || {};
+    if (session.userId !== userId) {
+      return res.status(400).json({ error: "session does not belong to this user" });
+    }
+
+    await deleteSessionWithChildren(sessionRef);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /admin/users/:userId/sessions/:sessionId error:", err);
+    res.status(500).json({ error: "failed to delete session" });
+  }
+});
+
 app.post("/listener/resolve", async (req, res) => {
   try {
     const user = await resolveListenerUser(req);
@@ -1154,6 +1398,11 @@ app.post("/users/ensure", async (req, res) => {
       username: req.body.username,
       email: req.body.email ?? null,
     });
+
+    if (isSuspendedUser(user)) {
+      return res.status(403).json({ error: "account is suspended" });
+    }
+
     res.status(201).json(toPublicUser(user));
   } catch (err) {
     console.error("POST /users/ensure error:", err);
@@ -1195,6 +1444,11 @@ app.post("/players", async (req, res) => {
       username: req.body.name,
       email: req.body.email ?? null,
     });
+
+    if (isSuspendedUser(user)) {
+      return res.status(403).json({ error: "account is suspended" });
+    }
+
     res.status(201).json(toPublicUser(user));
   } catch (err) {
     console.error("POST /players error:", err);
@@ -1263,6 +1517,10 @@ app.post("/sessions", async (req, res) => {
       user = await ensureUserRecord({ username, email });
     } else {
       return res.status(400).json({ error: "userId or username is required" });
+    }
+
+    if (isSuspendedUser(user)) {
+      return res.status(403).json({ error: "account is suspended" });
     }
 
     const trackName = safeString(req.body.trackName, null);
@@ -1880,7 +2138,7 @@ app.get("/schema", (req, res) => {
         "Downsampled points for drawing the track path without overloading one Firestore document.",
     },
     strategy:
-      "Sessions store driving data. trackMaps store reusable circuit calibration data for map overlays.",
+      "Sessions store driving data. trackMaps store reusable circuit calibration data for map overlays. Admin endpoints manage account status, roles, and recorded session times.",
   });
 });
 
