@@ -105,11 +105,13 @@ function serializeDoc(docSnap) {
     "recordedAt",
     "latestTelemetryAt",
     "lastSeenAt",
+    "lastUsedAt",
     "updatedAt",
     "calibratedAt",
     "finalizedAt",
     "createdFromSessionAt",
     "expiresAt",
+    "revokedAt",
   ]) {
     if (out[key] && typeof out[key].toDate === "function") {
       out[key] = out[key].toDate().toISOString();
@@ -463,6 +465,13 @@ async function createAuthSession(userId) {
   return token;
 }
 
+function getBearerToken(req) {
+  const authorization = req.get("authorization") || "";
+  return authorization.toLowerCase().startsWith("bearer ")
+    ? authorization.slice(7).trim()
+    : null;
+}
+
 async function findUserByIdentifier(identifier) {
   const value = safeString(identifier, null);
   if (!value) return null;
@@ -519,10 +528,7 @@ async function findUserByIdentifier(identifier) {
 
 async function authenticate(req, res, next) {
   try {
-    const authorization = req.get("authorization") || "";
-    const token = authorization.toLowerCase().startsWith("bearer ")
-      ? authorization.slice(7).trim()
-      : null;
+    const token = getBearerToken(req);
 
     if (!token) {
       return res.status(401).json({ error: "login required" });
@@ -558,6 +564,99 @@ async function authenticate(req, res, next) {
     console.error("Auth middleware error:", err);
     res.status(500).json({ error: "failed to verify login session" });
   }
+}
+
+function getListenerToken(req) {
+  const headerToken = safeString(req.get("x-listener-token"), null);
+  if (headerToken) return headerToken;
+
+  const authorization = req.get("authorization") || "";
+  if (authorization.toLowerCase().startsWith("listener ")) {
+    return authorization.slice(9).trim();
+  }
+
+  return safeString(req.body?.listenerToken, null);
+}
+
+async function createListenerToken(userId, label = "F1 listener") {
+  const token = `f1lt_${crypto.randomBytes(32).toString("hex")}`;
+  const tokenHash = authTokenHash(token);
+  const tokenId = crypto.randomUUID();
+  const tokenPreview = `${token.slice(0, 12)}...${token.slice(-6)}`;
+
+  await db.collection("listenerTokens").doc(tokenHash).set({
+    tokenId,
+    userId,
+    label: safeString(label, "F1 listener"),
+    tokenPreview,
+    createdAt: FieldValue.serverTimestamp(),
+    lastUsedAt: null,
+    revokedAt: null,
+  });
+
+  return {
+    token,
+    tokenId,
+    tokenPreview,
+  };
+}
+
+async function resolveListenerUser(req) {
+  const token = getListenerToken(req);
+  if (!token) return null;
+
+  const tokenRef = db.collection("listenerTokens").doc(authTokenHash(token));
+  const tokenSnap = await tokenRef.get();
+
+  if (!tokenSnap.exists) {
+    const err = new Error("invalid listener token");
+    err.status = 401;
+    throw err;
+  }
+
+  const tokenData = tokenSnap.data() || {};
+
+  if (tokenData.revokedAt) {
+    const err = new Error("listener token has been revoked");
+    err.status = 401;
+    throw err;
+  }
+
+  const userSnap = await db.collection("users").doc(tokenData.userId).get();
+  if (!userSnap.exists) {
+    const err = new Error("listener token user was not found");
+    err.status = 401;
+    throw err;
+  }
+
+  await tokenRef.set(
+    {
+      lastUsedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await userSnap.ref.set(
+    {
+      lastSeenAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  return toPublicUser(serializeDoc(userSnap));
+}
+
+function serializeListenerToken(docSnap) {
+  const data = serializeDoc(docSnap);
+  return {
+    id: data.tokenId || docSnap.id,
+    tokenId: data.tokenId || docSnap.id,
+    label: data.label || "F1 listener",
+    tokenPreview: data.tokenPreview || null,
+    createdAt: data.createdAt || null,
+    lastUsedAt: data.lastUsedAt || null,
+    revokedAt: data.revokedAt || null,
+  };
 }
 
 function requireAdmin(req, res, next) {
@@ -971,8 +1070,86 @@ app.post("/auth/logout", authenticate, async (req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/listener-tokens", authenticate, async (req, res) => {
+  try {
+    const snap = await db
+      .collection("listenerTokens")
+      .where("userId", "==", req.user.id)
+      .get();
+
+    const tokens = snap.docs
+      .map(serializeListenerToken)
+      .filter((token) => !token.revokedAt)
+      .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+
+    res.json({ tokens });
+  } catch (err) {
+    console.error("GET /listener-tokens error:", err);
+    res.status(500).json({ error: "failed to load listener tokens" });
+  }
+});
+
+app.post("/listener-tokens", authenticate, async (req, res) => {
+  try {
+    const tokenData = await createListenerToken(req.user.id, req.body.label);
+    res.status(201).json(tokenData);
+  } catch (err) {
+    console.error("POST /listener-tokens error:", err);
+    res.status(500).json({ error: "failed to create listener token" });
+  }
+});
+
+app.delete("/listener-tokens/:tokenId", authenticate, async (req, res) => {
+  try {
+    const tokenId = safeString(req.params.tokenId);
+    if (!tokenId) return res.status(400).json({ error: "tokenId is required" });
+
+    const snap = await db
+      .collection("listenerTokens")
+      .where("userId", "==", req.user.id)
+      .where("tokenId", "==", tokenId)
+      .limit(1)
+      .get();
+
+    if (snap.empty) {
+      return res.status(404).json({ error: "listener token not found" });
+    }
+
+    await snap.docs[0].ref.set(
+      {
+        revokedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /listener-tokens/:tokenId error:", err);
+    res.status(500).json({ error: "failed to revoke listener token" });
+  }
+});
+
+app.post("/listener/resolve", async (req, res) => {
+  try {
+    const user = await resolveListenerUser(req);
+    if (!user) {
+      return res.status(401).json({ error: "listener token is required" });
+    }
+
+    res.json({ user });
+  } catch (err) {
+    console.error("POST /listener/resolve error:", err);
+    res.status(err.status || 500).json({ error: err.message || "failed to resolve listener token" });
+  }
+});
+
 app.post("/users/ensure", async (req, res) => {
   try {
+    const listenerUser = await resolveListenerUser(req);
+    if (listenerUser) {
+      return res.status(200).json(listenerUser);
+    }
+
     const user = await ensureUserRecord({
       username: req.body.username,
       email: req.body.email ?? null,
@@ -980,7 +1157,7 @@ app.post("/users/ensure", async (req, res) => {
     res.status(201).json(toPublicUser(user));
   } catch (err) {
     console.error("POST /users/ensure error:", err);
-    res.status(400).json({ error: err.message });
+    res.status(err.status || 400).json({ error: err.message });
   }
 });
 
@@ -1067,13 +1244,16 @@ app.get("/sessions", async (req, res) => {
 
 app.post("/sessions", async (req, res) => {
   try {
+    const listenerUser = await resolveListenerUser(req);
     const userId = safeString(req.body.userId);
     const username = safeString(req.body.username, null);
     const email = safeString(req.body.email, null);
 
     let user = null;
 
-    if (userId) {
+    if (listenerUser) {
+      user = listenerUser;
+    } else if (userId) {
       const userSnap = await db.collection("users").doc(userId).get();
       if (!userSnap.exists) {
         return res.status(404).json({ error: "user not found" });
@@ -1129,7 +1309,7 @@ app.post("/sessions", async (req, res) => {
     res.status(201).json(serializeDoc(saved));
   } catch (err) {
     console.error("POST /sessions error:", err);
-    res.status(500).json({ error: "failed to create session" });
+    res.status(err.status || 500).json({ error: err.message || "failed to create session" });
   }
 });
 
@@ -1678,6 +1858,7 @@ app.get("/schema", (req, res) => {
       "usernames",
       "emails",
       "authSessions",
+      "listenerTokens",
       "sessions",
       "sessions/{sessionId}/telemetryChunks",
       "sessions/{sessionId}/laps",
