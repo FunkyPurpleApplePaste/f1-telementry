@@ -1041,6 +1041,58 @@ async function collectSessionMapPoints(sessionRef) {
   return sortMapPoints(points);
 }
 
+function buildLapTrailsFromMapPoints(points, maxPointsPerLap = 1200) {
+  const grouped = new Map();
+
+  for (const point of sortMapPoints(points)) {
+    if (point.lapNumber == null) continue;
+
+    const key = `lap-${point.lapNumber}`;
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        key,
+        lapNumber: point.lapNumber,
+        label: `Lap ${point.lapNumber} Trail`,
+        pointCount: 0,
+        originalPointCount: 0,
+        points: [],
+        startedAt: point.timestamp || null,
+        endedAt: null,
+      });
+    }
+
+    const trail = grouped.get(key);
+    trail.points.push({
+      timestamp: point.timestamp,
+      sampleIndex: point.sampleIndex,
+      lapNumber: point.lapNumber,
+      lapDistance: point.lapDistance,
+      totalDistance: point.totalDistance,
+      worldX: point.worldX,
+      worldY: point.worldY,
+      worldZ: point.worldZ,
+      speedKph: point.speedKph,
+      throttle: point.throttle,
+      brake: point.brake,
+      steering: point.steering,
+    });
+    trail.originalPointCount += 1;
+    trail.endedAt = point.timestamp || trail.endedAt;
+  }
+
+  return [...grouped.values()]
+    .filter((trail) => trail.points.length >= 2)
+    .map((trail) => {
+      const downsampled = downsamplePoints(trail.points, maxPointsPerLap);
+      return {
+        ...trail,
+        points: downsampled,
+        pointCount: downsampled.length,
+      };
+    })
+    .sort((a, b) => a.lapNumber - b.lapNumber);
+}
+
 async function saveCenterlineChunks(trackKey, points, version, chunkSize = 400) {
   const ref = db.collection("trackMaps").doc(trackKey);
   const batchLimit = 400;
@@ -1710,6 +1762,58 @@ app.post("/sessions/:id/laps", async (req, res) => {
   } catch (err) {
     console.error("POST /sessions/:id/laps error:", err);
     res.status(500).json({ error: "failed to save lap" });
+  }
+});
+
+app.get("/sessions/:id/laps", async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
+    const lapsSnap = await sessionRef.collection("laps").get();
+    const laps = lapsSnap.docs
+      .map((doc) => serializeDoc(doc))
+      .sort((a, b) => {
+        const aLap = parseInteger(a.lapNumber, 0) || 0;
+        const bLap = parseInteger(b.lapNumber, 0) || 0;
+        return aLap - bLap;
+      });
+
+    res.json({ sessionId, laps });
+  } catch (err) {
+    console.error("GET /sessions/:id/laps error:", err);
+    res.status(500).json({ error: "failed to fetch laps" });
+  }
+});
+
+app.get("/sessions/:id/lap-trails", async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
+    const maxPointsPerLap = parseInteger(req.query.maxPointsPerLap, 1200) || 1200;
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
+    const points = await collectSessionMapPoints(sessionRef);
+    const lapTrails = buildLapTrailsFromMapPoints(points, maxPointsPerLap);
+
+    res.json({
+      sessionId,
+      lapTrails,
+      lapCount: lapTrails.length,
+      sourcePointCount: points.length,
+    });
+  } catch (err) {
+    console.error("GET /sessions/:id/lap-trails error:", err);
+    res.status(500).json({ error: "failed to fetch lap trails" });
   }
 });
 
