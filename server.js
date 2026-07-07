@@ -7,6 +7,7 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 
 import { initializeApp, applicationDefault, cert } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 dotenv.config();
@@ -26,6 +27,7 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 }
 
 initializeApp({ credential });
+const firebaseAuth = getAuth();
 const db = getFirestore();
 
 app.use(helmet());
@@ -436,6 +438,16 @@ function toPublicUser(user) {
     isAdmin,
     isSuspended: safe.isSuspended === true,
   };
+}
+
+async function createFirebaseCustomToken(user) {
+  const publicUser = toPublicUser(user);
+
+  return firebaseAuth.createCustomToken(publicUser.id, {
+    role: publicUser.role || "user",
+    isAdmin: publicUser.isAdmin === true,
+    username: publicUser.username || "",
+  });
 }
 
 function isSuspendedUser(user) {
@@ -1146,7 +1158,9 @@ app.post("/auth/signup", async (req, res) => {
     const userSnap = await db.collection("users").doc(createdUser.id).get();
     const user = toPublicUser(serializeDoc(userSnap));
     const token = await createAuthSession(user.id);
-    res.status(201).json({ user, token });
+    const firebaseToken = await createFirebaseCustomToken(user);
+
+    res.status(201).json({ user, token, firebaseToken });
   } catch (err) {
     console.error("POST /auth/signup error:", err);
     res.status(400).json({ error: err.message });
@@ -1164,7 +1178,9 @@ app.post("/auth/login", async (req, res) => {
       return res.status(401).json({ error: "invalid name/email or password" });
     }
 
-    res.json(result);
+    const firebaseToken = await createFirebaseCustomToken(result.user);
+
+    res.json({ ...result, firebaseToken });
   } catch (err) {
     console.error("POST /auth/login error:", err);
     res.status(err.status || 500).json({ error: err.message || "failed to log in" });
