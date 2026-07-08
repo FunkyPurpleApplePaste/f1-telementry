@@ -454,19 +454,6 @@ function isSuspendedUser(user) {
   return user?.isSuspended === true || Boolean(user?.suspendedAt);
 }
 
-function hasEndedAt(value) {
-  if (!value) return false;
-  if (typeof value.toDate === "function") return true;
-  if (typeof value.toMillis === "function") return true;
-  if (typeof value.seconds === "number") return true;
-  if (typeof value === "string") return value.trim() !== "";
-  return true;
-}
-
-function isClosedSession(session) {
-  return Boolean(session) && hasEndedAt(session.endedAt);
-}
-
 function authTokenHash(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
@@ -2663,10 +2650,7 @@ function renderPostSessionMarkdown(report) {
   return lines.join("\n");
 }
 
-function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs, cornerDocs, options = {}) {
-  const reportPhase = safeString(options.phase, null) || (isClosedSession(sessionData) ? "final" : "live");
-  const reportTrigger = safeString(options.trigger, null) || (reportPhase === "final" ? "session_end" : "lap");
-  const triggerLapNumber = parseInteger(options.triggerLapNumber, null);
+function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs, cornerDocs) {
   const samplesByLap = new Map();
   for (const sample of samples) {
     if (sample.lapNumber === null) continue;
@@ -2720,9 +2704,6 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
   const report = stripUndefinedDeep({
     schema: POST_SESSION_REPORT_SCHEMA,
     status,
-    reportPhase,
-    reportTrigger,
-    triggerLapNumber,
     generatedAtIso: new Date().toISOString(),
     dataQuality,
     sessionSnapshot: {
@@ -2733,10 +2714,7 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
       trackName: safeString(sessionData.trackName, null),
       sessionType: parseInteger(sessionData.sessionType, null),
       startedAt: reportIso(sessionData.startedAt),
-      endedAt: reportIso(sessionData.endedAt),
-      reportPhase,
-      reportTrigger,
-      triggerLapNumber,
+      endedAt: reportIso(sessionData.endedAt) || new Date().toISOString(),
       sampleCount: samples.rawSampleCount ?? samples.length,
       analysedSampleCount: samples.length,
       lapCount: lapNumbers.length,
@@ -2883,7 +2861,7 @@ async function commitReportLapDetails(reportRef, lapSummaries, schema, sessionId
   return totalWrites;
 }
 
-async function buildAndSavePostSessionReport(sessionRef, options = {}) {
+async function buildAndSavePostSessionReport(sessionRef) {
   const sessionSnap = await sessionRef.get();
   if (!sessionSnap.exists) {
     const err = new Error("session not found");
@@ -2895,14 +2873,7 @@ async function buildAndSavePostSessionReport(sessionRef, options = {}) {
   const samples = await collectSessionTelemetrySamples(sessionRef);
   const lapDocs = await collectSessionLapDocs(sessionRef);
   const cornerDocs = await collectSessionCornerDocs(sessionRef);
-  const report = buildPostSessionReportDocument(
-    sessionRef.id,
-    sessionData,
-    samples,
-    lapDocs,
-    cornerDocs,
-    options
-  );
+  const report = buildPostSessionReportDocument(sessionRef.id, sessionData, samples, lapDocs, cornerDocs);
   const reportPath = "sessions/" + sessionRef.id + "/reports/postSession";
   const reportRef = sessionRef.collection("reports").doc("postSession");
 
@@ -2932,9 +2903,6 @@ async function buildAndSavePostSessionReport(sessionRef, options = {}) {
       postSessionReportUpdatedAt: FieldValue.serverTimestamp(),
       postSessionReportSummary: {
         schema: report.schema,
-        reportPhase: report.reportPhase,
-        reportTrigger: report.reportTrigger,
-        triggerLapNumber: report.triggerLapNumber,
         dataConfidence: report.dataQuality.confidence,
         sampleCount: report.sessionSnapshot.sampleCount,
         lapCount: report.sessionSnapshot.lapCount,
@@ -2953,9 +2921,6 @@ async function buildAndSavePostSessionReport(sessionRef, options = {}) {
   return {
     status: report.status,
     reportPath,
-    reportPhase: report.reportPhase,
-    reportTrigger: report.reportTrigger,
-    triggerLapNumber: report.triggerLapNumber,
     dataConfidence: report.dataQuality.confidence,
     sampleCount: report.sessionSnapshot.sampleCount,
     lapCount: report.sessionSnapshot.lapCount,
@@ -2968,97 +2933,6 @@ async function buildAndSavePostSessionReport(sessionRef, options = {}) {
     worstLap: report.worstLap,
   };
 }
-const livePostSessionReportJobs = new Map();
-
-function mergeLiveReportOptions(previous = {}, next = {}) {
-  const prevLap = parseInteger(previous.triggerLapNumber, null);
-  const nextLap = parseInteger(next.triggerLapNumber, null);
-
-  return {
-    ...previous,
-    ...next,
-    triggerLapNumber:
-      nextLap !== null && (prevLap === null || nextLap >= prevLap) ? nextLap : prevLap,
-  };
-}
-
-async function runLivePostSessionReportQueue(sessionRef, state) {
-  state.running = true;
-  state.promise = (async () => {
-    try {
-      while (state.pending) {
-        const options = state.pending;
-        state.pending = null;
-
-        await sessionRef.set(
-          stripUndefinedDeep({
-            postSessionReportStatus: "updating",
-            postSessionReportPhase: options.phase || "live",
-            postSessionReportTrigger: options.trigger || "lap",
-            postSessionReportTriggerLapNumber: parseInteger(options.triggerLapNumber, null),
-            postSessionReportQueuedAt: FieldValue.serverTimestamp(),
-          }),
-          { merge: true }
-        );
-
-        try {
-          await buildAndSavePostSessionReport(sessionRef, options);
-        } catch (err) {
-          console.error("Live post-session report update error:", err);
-          await sessionRef.set(
-            stripUndefinedDeep({
-              postSessionReportStatus: "failed",
-              postSessionReportError: err.message || "failed to update live report",
-              postSessionReportUpdatedAt: FieldValue.serverTimestamp(),
-            }),
-            { merge: true }
-          );
-        }
-      }
-    } finally {
-      state.running = false;
-      if (!state.pending) {
-        livePostSessionReportJobs.delete(sessionRef.id);
-      } else {
-        runLivePostSessionReportQueue(sessionRef, state);
-      }
-    }
-  })();
-
-  await state.promise;
-}
-
-function queueLivePostSessionReportBuild(sessionRef, options = {}) {
-  const sessionId = sessionRef.id;
-  const state =
-    livePostSessionReportJobs.get(sessionId) || {
-      running: false,
-      pending: null,
-      promise: null,
-    };
-
-  state.pending = mergeLiveReportOptions(state.pending || {}, {
-    phase: "live",
-    trigger: "lap",
-    ...options,
-  });
-
-  livePostSessionReportJobs.set(sessionId, state);
-
-  if (!state.running) {
-    setImmediate(() => {
-      runLivePostSessionReportQueue(sessionRef, state).catch((err) => {
-        console.error("Live post-session report queue error:", err);
-      });
-    });
-  }
-}
-
-function getLivePostSessionReportPromise(sessionId) {
-  const state = livePostSessionReportJobs.get(sessionId);
-  return state?.promise || null;
-}
-
 // POST_SESSION_AI_REPORT_END
 
 app.post("/sessions/:id/end", async (req, res) => {
@@ -3071,58 +2945,10 @@ app.post("/sessions/:id/end", async (req, res) => {
       return res.status(404).json({ error: "session not found" });
     }
 
-    const sessionData = sessionSnap.data() || {};
-    const rebuildReport =
-      parseBoolean(req.query.rebuildReport, false) ||
-      parseBoolean(req.body?.rebuildReport, false);
-
-    if (isClosedSession(sessionData) && !rebuildReport) {
-      const reportRef = sessionRef.collection("reports").doc("postSession");
-      const reportSnap = await reportRef.get();
-      const existingReport = reportSnap.exists ? serializeDoc(reportSnap) : null;
-
-      return res.json({
-        ...serializeDoc(sessionSnap),
-        postSessionReport: existingReport
-          ? {
-              status: "ready",
-              alreadyEnded: true,
-              reportPath: "sessions/" + sessionId + "/reports/postSession",
-              reportPhase: existingReport.reportPhase || "final",
-              reportTrigger: existingReport.reportTrigger || "session_end",
-              sampleCount:
-                existingReport.sessionSnapshot?.sampleCount ??
-                existingReport.summary?.sampleCount ??
-                null,
-              lapCount:
-                existingReport.lapSummaries?.length ??
-                existingReport.summary?.lapCount ??
-                null,
-              coachSignalCount:
-                existingReport.topCoachSignals?.length ??
-                existingReport.summary?.coachSignalCount ??
-                null,
-              lapDetailDocCount: existingReport.summary?.lapDetailDocCount ?? null,
-            }
-          : {
-              status: sessionData.postSessionReportStatus || "already-ended",
-              alreadyEnded: true,
-              message: "Session was already ended; report was not rebuilt.",
-            },
-      });
-    }
-
-    const liveReportPromise = getLivePostSessionReportPromise(sessionId);
-    if (liveReportPromise) {
-      await liveReportPromise.catch(() => null);
-    }
-
     await sessionRef.set(
       {
         endedAt: FieldValue.serverTimestamp(),
         postSessionReportStatus: "building",
-        postSessionReportPhase: "final",
-        postSessionReportTrigger: "session_end",
       },
       { merge: true }
     );
@@ -3130,10 +2956,7 @@ app.post("/sessions/:id/end", async (req, res) => {
     let postSessionReport = null;
 
     try {
-      postSessionReport = await buildAndSavePostSessionReport(sessionRef, {
-        phase: "final",
-        trigger: "session_end",
-      });
+      postSessionReport = await buildAndSavePostSessionReport(sessionRef);
     } catch (reportErr) {
       console.error("Post-session report generation error:", reportErr);
       postSessionReport = {
@@ -3206,15 +3029,6 @@ app.post("/sessions/:id/laps", async (req, res) => {
       return res.status(404).json({ error: "session not found" });
     }
 
-    if (isClosedSession(sessionSnap.data() || {})) {
-      return res.json({
-        success: true,
-        ignored: true,
-        reason: "session ended",
-        lapNumber,
-      });
-    }
-
     const lapRef = sessionRef.collection("laps").doc(`lap_${lapNumber}`);
 
     const effectiveSector3Ms =
@@ -3273,29 +3087,7 @@ app.post("/sessions/:id/laps", async (req, res) => {
       { merge: true }
     );
 
-    const shouldUpdateReport =
-      parseBoolean(req.query.updateReport, true) !== false &&
-      parseBoolean(req.body.updateReport, true) !== false;
-
-    if (shouldUpdateReport) {
-      queueLivePostSessionReportBuild(sessionRef, {
-        triggerLapNumber: lapNumber,
-      });
-    }
-
-    res.status(201).json({
-      success: true,
-      lapNumber,
-      postSessionReport: shouldUpdateReport
-        ? {
-            status: "queued",
-            reportPhase: "live",
-            reportTrigger: "lap",
-            triggerLapNumber: lapNumber,
-            reportPath: "sessions/" + sessionId + "/reports/postSession",
-          }
-        : null,
-    });
+    res.status(201).json({ success: true, lapNumber });
   } catch (err) {
     console.error("POST /sessions/:id/laps error:", err);
     res.status(500).json({ error: "failed to save lap" });
@@ -3362,14 +3154,6 @@ app.post("/sessions/:id/corners", async (req, res) => {
 
     if (!sessionSnap.exists) {
       return res.status(404).json({ error: "session not found" });
-    }
-
-    if (isClosedSession(sessionSnap.data() || {})) {
-      return res.json({
-        success: true,
-        ignored: true,
-        reason: "session ended",
-      });
     }
 
     const cornerRef = sessionRef.collection("corners").doc();
@@ -3443,11 +3227,6 @@ app.post("/telemetry/latest", async (req, res) => {
       return res.status(404).json({ error: "session not found" });
     }
 
-    const sessionData = sessionSnap.data() || {};
-    if (isClosedSession(sessionData)) {
-      return res.json({ success: true, ignored: true, reason: "session ended" });
-    }
-
     const latestMapPosition = buildLatestMapPosition(latestTelemetry);
 
     const updateBody = {
@@ -3487,15 +3266,6 @@ app.post("/telemetry/batch", async (req, res) => {
     }
 
     const sessionData = sessionSnap.data() || {};
-    if (isClosedSession(sessionData)) {
-      return res.json({
-        success: true,
-        ignored: true,
-        reason: "session ended",
-        count: 0,
-      });
-    }
-
     const stats = buildMapStats(samples);
     const latestTelemetry = samples[samples.length - 1];
     const latestMapPosition = stats.latestMapPosition ?? buildLatestMapPosition(latestTelemetry);
