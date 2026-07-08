@@ -873,23 +873,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-function canReadUserSessions(req, userId) {
-  return Boolean(req.user?.isAdmin || (userId && req.user?.id === userId));
-}
-
-function canReadSession(req, sessionData) {
-  return Boolean(req.user?.isAdmin || (sessionData?.userId && req.user?.id === sessionData.userId));
-}
-
-function requireReadableSession(req, res, sessionData) {
-  if (!canReadSession(req, sessionData)) {
-    res.status(403).json({ error: "session access denied" });
-    return false;
-  }
-
-  return true;
-}
-
 async function deleteQueryInBatches(queryRef, batchSize = 400) {
   while (true) {
     const snap = await queryRef.limit(batchSize).get();
@@ -1767,19 +1750,16 @@ app.post("/players", async (req, res) => {
   }
 });
 
-app.get("/users/:userId/sessions", authenticate, async (req, res) => {
+app.get("/users/:userId/sessions", async (req, res) => {
   try {
     const userId = safeString(req.params.userId);
     if (!userId) return res.status(400).json({ error: "userId is required" });
-    if (!canReadUserSessions(req, userId)) {
-      return res.status(403).json({ error: "session access denied" });
-    }
 
     const snap = await db
       .collection("sessions")
       .where("userId", "==", userId)
       .orderBy("startedAt", "desc")
-      .limit(50)
+      .limit(20)
       .get();
 
     res.json(snap.docs.map(serializeDoc));
@@ -1789,30 +1769,17 @@ app.get("/users/:userId/sessions", authenticate, async (req, res) => {
   }
 });
 
-app.get("/sessions", authenticate, async (req, res) => {
+app.get("/sessions", async (req, res) => {
   try {
-    const requestedUserId = safeString(req.query.userId, null);
-    const wantsAll =
-      parseBoolean(req.query.all, false) === true ||
-      safeString(req.query.scope, null) === "all";
-    const effectiveUserId =
-      req.user?.isAdmin && wantsAll ? null : requestedUserId || req.user?.id;
+    const userId = safeString(req.query.userId, null);
 
-    if (requestedUserId && !canReadUserSessions(req, requestedUserId)) {
-      return res.status(403).json({ error: "session access denied" });
-    }
-
-    if (!req.user?.isAdmin && !effectiveUserId) {
-      return res.status(403).json({ error: "session access denied" });
-    }
-
-    let q = db.collection("sessions").orderBy("startedAt", "desc").limit(50);
-    if (effectiveUserId) {
+    let q = db.collection("sessions").orderBy("startedAt", "desc").limit(20);
+    if (userId) {
       q = db
         .collection("sessions")
-        .where("userId", "==", effectiveUserId)
+        .where("userId", "==", userId)
         .orderBy("startedAt", "desc")
-        .limit(50);
+        .limit(20);
     }
 
     const snap = await q.get();
@@ -3796,7 +3763,7 @@ app.post("/sessions/:id/end", async (req, res) => {
   }
 });
 
-app.get("/sessions/:id/reports/post-session", authenticate, async (req, res) => {
+app.get("/sessions/:id/reports/post-session", async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
     const sessionRef = db.collection("sessions").doc(sessionId);
@@ -3805,7 +3772,6 @@ app.get("/sessions/:id/reports/post-session", authenticate, async (req, res) => 
     if (!sessionSnap.exists) {
       return res.status(404).json({ error: "session not found" });
     }
-    if (!requireReadableSession(req, res, sessionSnap.data() || {})) return;
 
     const reportSnap = await sessionRef.collection("reports").doc("postSession").get();
     if (!reportSnap.exists) {
@@ -3944,7 +3910,7 @@ app.post("/sessions/:id/laps", async (req, res) => {
   }
 });
 
-app.get("/sessions/:id/laps", authenticate, async (req, res) => {
+app.get("/sessions/:id/laps", async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
     const sessionRef = db.collection("sessions").doc(sessionId);
@@ -3953,7 +3919,6 @@ app.get("/sessions/:id/laps", authenticate, async (req, res) => {
     if (!sessionSnap.exists) {
       return res.status(404).json({ error: "session not found" });
     }
-    if (!requireReadableSession(req, res, sessionSnap.data() || {})) return;
 
     const lapsSnap = await sessionRef.collection("laps").get();
     const laps = lapsSnap.docs
@@ -3971,7 +3936,7 @@ app.get("/sessions/:id/laps", authenticate, async (req, res) => {
   }
 });
 
-app.get("/sessions/:id/lap-trails", authenticate, async (req, res) => {
+app.get("/sessions/:id/lap-trails", async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
     const requestedMaxPointsPerLap = parseInteger(req.query.maxPointsPerLap, 400) || 400;
@@ -3982,7 +3947,6 @@ app.get("/sessions/:id/lap-trails", authenticate, async (req, res) => {
     if (!sessionSnap.exists) {
       return res.status(404).json({ error: "session not found" });
     }
-    if (!requireReadableSession(req, res, sessionSnap.data() || {})) return;
 
     const points = await collectSessionMapPoints(sessionRef, {
       maxPoints: Math.max(500, maxPointsPerLap * MAX_LAP_TRAILS),
@@ -4292,7 +4256,7 @@ app.post("/sessions/:id/track-map/finalize", authenticate, requireAdmin, async (
   }
 });
 
-app.get("/sessions/:id/track-map", authenticate, async (req, res) => {
+app.get("/sessions/:id/track-map", async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
     const sessionRef = db.collection("sessions").doc(sessionId);
@@ -4301,7 +4265,6 @@ app.get("/sessions/:id/track-map", authenticate, async (req, res) => {
     if (!sessionSnap.exists) {
       return res.status(404).json({ error: "session not found" });
     }
-    if (!requireReadableSession(req, res, sessionSnap.data() || {})) return;
 
     const data = sessionSnap.data() || {};
     res.json({
