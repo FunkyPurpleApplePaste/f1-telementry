@@ -1796,7 +1796,7 @@ app.get("/leaderboard", async (req, res) => {
     const limitRows = Math.max(1, Math.min(limitValue, 100));
     const scanLimitValue = parseInteger(req.query.scanLimit, LEADERBOARD_SESSION_SCAN_LIMIT) || LEADERBOARD_SESSION_SCAN_LIMIT;
     const sessionScanLimit = Math.max(limitRows, Math.min(scanLimitValue, 500));
-    const requestedTrackKey = safeString(req.query.trackKey, null);
+    const trackKeyFilter = safeString(req.query.trackKey, null);
     const trackIdFilter = parseInteger(req.query.trackId, null);
     const trackNameFilter = safeString(req.query.trackName, null);
     const normalizedTrackNameFilter = trackNameFilter ? normalizeUsername(trackNameFilter) : null;
@@ -1807,27 +1807,10 @@ app.get("/leaderboard", async (req, res) => {
       .limit(sessionScanLimit)
       .get();
 
-    const bestByTrackAndUser = new Map();
-    const trackStats = new Map();
+    const bestByUser = new Map();
     let scannedSessions = 0;
     let scannedLaps = 0;
     let validLaps = 0;
-
-    function ensureTrack(entry) {
-      const key = entry.trackKey || trackKeyFrom(entry.trackId, entry.trackName);
-      if (!trackStats.has(key)) {
-        trackStats.set(key, {
-          trackKey: key,
-          trackName: entry.trackName || key,
-          trackId: entry.trackId ?? null,
-          validLaps: 0,
-          userKeys: new Set(),
-          bestLapTimeMs: null,
-          latestActivityMs: 0,
-        });
-      }
-      return trackStats.get(key);
-    }
 
     for (const sessionDoc of sessionsSnap.docs) {
       scannedSessions += 1;
@@ -1843,25 +1826,16 @@ app.get("/leaderboard", async (req, res) => {
         if (!isRealValidLeaderboardLap(lapData)) continue;
 
         const entry = buildLeaderboardEntry(sessionDoc, sessionData, lapDoc, lapData);
-        if (!entry.trackKey) continue;
-
-        const stats = ensureTrack(entry);
-        stats.validLaps += 1;
-        stats.userKeys.add(userKey);
-        stats.latestActivityMs = Math.max(
-          stats.latestActivityMs,
-          entry.sortRecordedAtMs || entry.sortStartedAtMs || 0
-        );
-        if (stats.bestLapTimeMs === null || entry.lapTimeMs < stats.bestLapTimeMs) {
-          stats.bestLapTimeMs = entry.lapTimeMs;
+        if (trackKeyFilter && entry.trackKey !== trackKeyFilter) continue;
+        if (trackIdFilter !== null && entry.trackId !== trackIdFilter) continue;
+        if (
+          normalizedTrackNameFilter &&
+          normalizeUsername(entry.trackName || "") !== normalizedTrackNameFilter
+        ) {
+          continue;
         }
 
         validLaps += 1;
-        if (!bestByTrackAndUser.has(entry.trackKey)) {
-          bestByTrackAndUser.set(entry.trackKey, new Map());
-        }
-
-        const bestByUser = bestByTrackAndUser.get(entry.trackKey);
         const existing = bestByUser.get(userKey);
 
         if (
@@ -1874,67 +1848,26 @@ app.get("/leaderboard", async (req, res) => {
       }
     }
 
-    const tracks = [...trackStats.values()]
-      .map((track) => ({
-        trackKey: track.trackKey,
-        trackName: track.trackName,
-        trackId: track.trackId,
-        validLaps: track.validLaps,
-        userCount: track.userKeys.size,
-        bestLapTimeMs: track.bestLapTimeMs,
-        bestLapTime: formatLapTime(track.bestLapTimeMs),
-        latestActivityMs: track.latestActivityMs,
-      }))
-      .sort((a, b) => {
-        if (b.latestActivityMs !== a.latestActivityMs) return b.latestActivityMs - a.latestActivityMs;
-        return String(a.trackName || "").localeCompare(String(b.trackName || ""));
-      });
-
-    let activeTrack = null;
-    if (requestedTrackKey) {
-      activeTrack = tracks.find((track) => track.trackKey === requestedTrackKey) || null;
-    } else if (trackIdFilter !== null) {
-      activeTrack = tracks.find((track) => track.trackId === trackIdFilter) || null;
-    } else if (normalizedTrackNameFilter) {
-      activeTrack =
-        tracks.find((track) => normalizeUsername(track.trackName || "") === normalizedTrackNameFilter) ||
-        null;
-    }
-
-    if (!activeTrack) {
-      activeTrack = tracks[0] || null;
-    }
-
-    const activeTrackKey = activeTrack?.trackKey || null;
-    const activeBestByUser = activeTrackKey
-      ? bestByTrackAndUser.get(activeTrackKey) || new Map()
-      : new Map();
-    const rows = rankLeaderboardEntries([...activeBestByUser.values()]).slice(0, limitRows);
+    const rows = rankLeaderboardEntries([...bestByUser.values()]).slice(0, limitRows);
 
     res.json({
       rows,
-      tracks,
-      activeTrackKey,
-      activeTrack,
       filters: {
-        trackKey: activeTrackKey,
-        trackId: activeTrack?.trackId ?? trackIdFilter,
-        trackName: activeTrack?.trackName ?? trackNameFilter,
+        trackKey: trackKeyFilter,
+        trackId: trackIdFilter,
+        trackName: trackNameFilter,
       },
       meta: {
-        leaderboardType: "best_valid_actual_lap_per_user_per_track",
-        trackScoped: true,
+        leaderboardType: "best_valid_actual_lap_per_user",
         rules: [
-          "Leaderboards are separated by track.",
           "Only laps with valid === true are eligible.",
           "Lap time must be a real lapTimeMs, not theoretical best.",
-          "Each user appears once per track with their fastest eligible lap.",
+          "Each user appears once with their fastest eligible lap.",
         ],
         scannedSessions,
         scannedLaps,
         validLaps,
-        trackCount: tracks.length,
-        userCount: activeBestByUser.size,
+        userCount: bestByUser.size,
       },
     });
   } catch (err) {
