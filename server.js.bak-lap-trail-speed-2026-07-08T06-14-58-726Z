@@ -226,19 +226,19 @@ function extractMapPoint(sample) {
   if (!sample || typeof sample !== "object") return null;
 
   const mapPosition = sample.mapPosition || {};
-  const worldX = finiteNumberOrNull(sample.worldX ?? mapPosition.worldX ?? sample.x);
-  const worldY = finiteNumberOrNull(sample.worldY ?? mapPosition.worldY ?? sample.y);
-  const worldZ = finiteNumberOrNull(sample.worldZ ?? mapPosition.worldZ ?? sample.z);
+  const worldX = finiteNumberOrNull(sample.worldX ?? mapPosition.worldX);
+  const worldY = finiteNumberOrNull(sample.worldY ?? mapPosition.worldY);
+  const worldZ = finiteNumberOrNull(sample.worldZ ?? mapPosition.worldZ);
 
   if (worldX === null || worldZ === null) return null;
 
   return {
-    timestamp: safeString(sample.timestamp ?? sample.t, null),
-    sampleIndex: parseInteger(sample.sampleIndex ?? sample.i, null),
+    timestamp: safeString(sample.timestamp, null),
+    sampleIndex: parseInteger(sample.sampleIndex, null),
 
-    lapNumber: parseInteger(sample.lapNumber ?? sample.lap, null),
-    lapDistance: finiteNumberOrNull(sample.lapDistance ?? sample.d),
-    totalDistance: finiteNumberOrNull(sample.totalDistance ?? sample.td),
+    lapNumber: parseInteger(sample.lapNumber, null),
+    lapDistance: finiteNumberOrNull(sample.lapDistance),
+    totalDistance: finiteNumberOrNull(sample.totalDistance),
 
     worldX,
     worldY,
@@ -248,11 +248,11 @@ function extractMapPoint(sample) {
     pitch: finiteNumberOrNull(sample.pitch),
     roll: finiteNumberOrNull(sample.roll),
 
-    speedKph: finiteNumberOrNull(sample.speedKph ?? sample.v),
-    throttle: finiteNumberOrNull(sample.throttle ?? sample.th),
-    brake: finiteNumberOrNull(sample.brake ?? sample.br),
-    steering: finiteNumberOrNull(sample.steering ?? sample.st),
-    pitStatus: parseInteger(sample.pitStatus ?? sample.pit, null),
+    speedKph: finiteNumberOrNull(sample.speedKph),
+    throttle: finiteNumberOrNull(sample.throttle),
+    brake: finiteNumberOrNull(sample.brake),
+    steering: finiteNumberOrNull(sample.steering),
+    pitStatus: parseInteger(sample.pitStatus, null),
 
     trackId: parseInteger(sample.trackId, null),
     trackName: safeString(sample.trackName, null),
@@ -415,7 +415,6 @@ function pointToSmallMapPoint(point) {
     br: point.brake,
     th: point.throttle,
     st: point.steering,
-    pit: point.pitStatus,
   };
 }
 
@@ -1147,8 +1146,7 @@ async function collectSessionMapPoints(sessionRef, options = {}) {
 
     for (const doc of chunksSnap.docs) {
       const data = doc.data() || {};
-      const previewPoints = Array.isArray(data.mapPreviewPoints) ? data.mapPreviewPoints : [];
-      const samples = previewPoints.length ? previewPoints : (Array.isArray(data.samples) ? data.samples : []);
+      const samples = Array.isArray(data.samples) ? data.samples : [];
 
       for (const sample of samples) {
         const point = extractMapPoint(sample);
@@ -1831,8 +1829,7 @@ const MAX_REPORT_LAP_SUMMARIES = Number(process.env.POST_SESSION_MAX_LAP_SUMMARI
 const POST_SESSION_LIVE_REPORT_ENABLED = process.env.POST_SESSION_LIVE_REPORT_ENABLED !== "false";
 const POST_SESSION_FINAL_REPORT_ENABLED = process.env.POST_SESSION_FINAL_REPORT_ENABLED !== "false";
 const POST_SESSION_LIVE_REPORT_DEBOUNCE_MS = Number(process.env.POST_SESSION_LIVE_REPORT_DEBOUNCE_MS || 12000);
-const LAP_TRAIL_SPEED_PATCH_APPLIED = true;
-const MAP_POINT_CHUNK_PAGE_SIZE = Number(process.env.MAP_POINT_CHUNK_PAGE_SIZE || 25);
+const MAP_POINT_CHUNK_PAGE_SIZE = Number(process.env.MAP_POINT_CHUNK_PAGE_SIZE || 2);
 const MAX_SESSION_MAP_POINTS = Number(process.env.MAX_SESSION_MAP_POINTS || 5000);
 const MAX_LAP_TRAILS = Number(process.env.MAX_LAP_TRAILS || 12);
 function reportRound(value, digits = 2) {
