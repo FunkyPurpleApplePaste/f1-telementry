@@ -77,43 +77,6 @@ function parseBoolean(value, fallback = null) {
   return fallback;
 }
 
-function parseClientEndDate(value) {
-  const raw = safeString(value, null);
-  if (!raw) return null;
-
-  const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) return null;
-
-  const now = Date.now();
-  const maxFutureMs = 5 * 60 * 1000;
-  if (parsed.getTime() > now + maxFutureMs) {
-    return new Date(now);
-  }
-
-  return parsed;
-}
-
-function buildEndMetadata(req, fallbackSource = "server_received") {
-  const endedAt =
-    parseClientEndDate(req.body?.endedAt) ||
-    parseClientEndDate(req.body?.endDetectedAt) ||
-    parseClientEndDate(req.body?.endedAtIso);
-
-  return stripUndefinedDeep({
-    endedAt,
-    endedAtSource:
-      safeString(req.body?.endedAtSource, null) ||
-      safeString(req.body?.endSource, null) ||
-      (endedAt ? "listener_detected" : fallbackSource),
-    endReason:
-      safeString(req.body?.endReason, null) ||
-      safeString(req.body?.reason, null),
-    endPacketType: safeString(req.body?.endPacketType, null),
-    listenerClosedAt: parseClientEndDate(req.body?.listenerClosedAt),
-  });
-}
-
-
 function stripUndefinedDeep(value) {
   if (Array.isArray(value)) {
     return value.map(stripUndefinedDeep);
@@ -3240,32 +3203,9 @@ app.post("/sessions/:id/end", async (req, res) => {
     }
 
     const sessionData = sessionSnap.data() || {};
-    const endMetadata = buildEndMetadata(req);
-    const requestedEndedAt = endMetadata.endedAt || null;
-    const currentEndedAt = asDate(sessionData.endedAt);
     const rebuildReport =
       parseBoolean(req.query.rebuildReport, false) ||
       parseBoolean(req.body?.rebuildReport, false);
-
-    if (
-      isClosedSession(sessionData) &&
-      !rebuildReport &&
-      requestedEndedAt &&
-      (!currentEndedAt || requestedEndedAt.getTime() < currentEndedAt.getTime())
-    ) {
-      await sessionRef.set(
-        stripUndefinedDeep({
-          endedAt: requestedEndedAt,
-          endedAtCorrectedAt: FieldValue.serverTimestamp(),
-          endedAtServerReceivedAt: FieldValue.serverTimestamp(),
-          endedAtSource: endMetadata.endedAtSource,
-          endReason: endMetadata.endReason,
-          endPacketType: endMetadata.endPacketType,
-          listenerClosedAt: endMetadata.listenerClosedAt,
-        }),
-        { merge: true }
-      );
-    }
 
     if (isClosedSession(sessionData) && !rebuildReport) {
       const reportRef = sessionRef.collection("reports").doc("postSession");
@@ -3309,17 +3249,12 @@ app.post("/sessions/:id/end", async (req, res) => {
     }
 
     await sessionRef.set(
-      stripUndefinedDeep({
-        endedAt: requestedEndedAt || FieldValue.serverTimestamp(),
-        endedAtServerReceivedAt: FieldValue.serverTimestamp(),
-        endedAtSource: endMetadata.endedAtSource,
-        endReason: endMetadata.endReason,
-        endPacketType: endMetadata.endPacketType,
-        listenerClosedAt: endMetadata.listenerClosedAt,
+      {
+        endedAt: FieldValue.serverTimestamp(),
         postSessionReportStatus: "building",
         postSessionReportPhase: "final",
         postSessionReportTrigger: "session_end",
-      }),
+      },
       { merge: true }
     );
 
