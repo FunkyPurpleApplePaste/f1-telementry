@@ -8,7 +8,7 @@ import crypto from "crypto";
 
 import { initializeApp, applicationDefault, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-import { getFirestore, FieldValue, FieldPath } from "firebase-admin/firestore";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 dotenv.config();
 
@@ -1676,14 +1676,6 @@ app.patch("/sessions/:id", async (req, res) => {
 
 // POST_SESSION_AI_REPORT_START
 const POST_SESSION_REPORT_SCHEMA = "f1-coach-evidence-report-v2";
-const REPORT_TELEMETRY_CHUNK_PAGE_SIZE = Number(process.env.POST_SESSION_CHUNK_PAGE_SIZE || 20);
-const MAX_REPORT_SAMPLES_PER_LAP = Number(process.env.POST_SESSION_MAX_SAMPLES_PER_LAP || 450);
-const MAX_REPORT_TOTAL_SAMPLES = Number(process.env.POST_SESSION_MAX_TOTAL_SAMPLES || 6000);
-const MAX_REPORT_LAP_DETAIL_DOCS = Number(process.env.POST_SESSION_MAX_LAP_DETAIL_DOCS || 120);
-const MAX_REPORT_FINDINGS = Number(process.env.POST_SESSION_MAX_FINDINGS || 16);
-const MAX_REPORT_SIGNALS = Number(process.env.POST_SESSION_MAX_SIGNALS || 14);
-const MAX_MARKDOWN_LAPS = Number(process.env.POST_SESSION_MAX_MARKDOWN_LAPS || 12);
-const MAX_AI_MARKDOWN_CHARS = Number(process.env.POST_SESSION_MAX_MARKDOWN_CHARS || 180000);
 
 function reportRound(value, digits = 2) {
   if (value === null || value === undefined) return null;
@@ -1817,86 +1809,29 @@ function sortReportSamples(samples) {
   });
 }
 
-function downsampleReportSamples(samples, maxSamples) {
-  if (!Array.isArray(samples) || samples.length <= maxSamples) return samples;
-  if (maxSamples <= 0) return [];
-
-  const out = [];
-  const step = (samples.length - 1) / Math.max(1, maxSamples - 1);
-
-  for (let i = 0; i < maxSamples; i += 1) {
-    out.push(samples[Math.round(i * step)]);
-  }
-
-  return out;
-}
-
 async function collectSessionTelemetrySamples(sessionRef) {
-  const samplesByLap = new Map();
-  let fallbackIndex = 0;
-  let rawSampleCount = 0;
-  let lastDoc = null;
-
-  while (true) {
-    let queryRef = sessionRef
-      .collection("telemetryChunks")
-      .orderBy(FieldPath.documentId())
-      .limit(REPORT_TELEMETRY_CHUNK_PAGE_SIZE);
-
-    if (lastDoc) {
-      queryRef = queryRef.startAfter(lastDoc);
-    }
-
-    const chunksSnap = await queryRef.get();
-    if (chunksSnap.empty) break;
-
-    for (const doc of chunksSnap.docs) {
-      const data = doc.data() || {};
-      const chunkSamples = Array.isArray(data.samples) ? data.samples : [];
-
-      for (const sample of chunkSamples) {
-        fallbackIndex += 1;
-        rawSampleCount += 1;
-
-        const normalized = normalizeReportSample(sample, fallbackIndex);
-        const hasDrivingData =
-          normalized.speedKph !== null ||
-          normalized.throttle !== null ||
-          normalized.brake !== null ||
-          normalized.steering !== null;
-
-        if (!hasDrivingData) continue;
-
-        const lapKey = normalized.lapNumber === null ? "unknown" : String(normalized.lapNumber);
-        if (!samplesByLap.has(lapKey)) samplesByLap.set(lapKey, []);
-
-        const bucket = samplesByLap.get(lapKey);
-        bucket.push(normalized);
-
-        if (bucket.length > Math.ceil(MAX_REPORT_SAMPLES_PER_LAP * 1.5)) {
-          samplesByLap.set(lapKey, downsampleReportSamples(bucket, MAX_REPORT_SAMPLES_PER_LAP));
-        }
-      }
-    }
-
-    lastDoc = chunksSnap.docs[chunksSnap.docs.length - 1];
-    if (chunksSnap.size < REPORT_TELEMETRY_CHUNK_PAGE_SIZE) break;
-  }
-
+  const chunksSnap = await sessionRef.collection("telemetryChunks").get();
   const samples = [];
-  for (const bucket of samplesByLap.values()) {
-    samples.push(...downsampleReportSamples(bucket, MAX_REPORT_SAMPLES_PER_LAP));
+  let fallbackIndex = 0;
+
+  for (const doc of chunksSnap.docs) {
+    const data = doc.data() || {};
+    const chunkSamples = Array.isArray(data.samples) ? data.samples : [];
+
+    for (const sample of chunkSamples) {
+      fallbackIndex += 1;
+      const normalized = normalizeReportSample(sample, fallbackIndex);
+      const hasDrivingData =
+        normalized.speedKph !== null ||
+        normalized.throttle !== null ||
+        normalized.brake !== null ||
+        normalized.steering !== null;
+
+      if (hasDrivingData) samples.push(normalized);
+    }
   }
 
-  const sorted = sortReportSamples(samples);
-  const capped = downsampleReportSamples(sorted, MAX_REPORT_TOTAL_SAMPLES);
-
-  Object.defineProperty(capped, "rawSampleCount", {
-    value: rawSampleCount,
-    enumerable: false,
-  });
-
-  return capped;
+  return sortReportSamples(samples);
 }
 
 async function collectSessionLapDocs(sessionRef) {
@@ -2715,8 +2650,7 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
       sessionType: parseInteger(sessionData.sessionType, null),
       startedAt: reportIso(sessionData.startedAt),
       endedAt: reportIso(sessionData.endedAt) || new Date().toISOString(),
-      sampleCount: samples.rawSampleCount ?? samples.length,
-      analysedSampleCount: samples.length,
+      sampleCount: samples.length,
       lapCount: lapNumbers.length,
       cornerCount: cornerDocs.length,
       avgSpeedKph: reportRound(reportAvg(speeds), 1),
@@ -2743,122 +2677,8 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
     topCoachSignals,
   });
 
-  report.aiReadableMarkdown = limitReportText(
-    renderPostSessionMarkdown({
-      ...report,
-      lapSummaries: report.lapSummaries.slice(0, MAX_MARKDOWN_LAPS),
-      lapComparisonTable: report.lapComparisonTable.slice(0, MAX_MARKDOWN_LAPS),
-      precisionFindings: report.precisionFindings.slice(0, MAX_REPORT_FINDINGS),
-      topCoachSignals: report.topCoachSignals.slice(0, MAX_REPORT_SIGNALS),
-    })
-  );
+  report.aiReadableMarkdown = renderPostSessionMarkdown(report);
   return report;
-}
-
-function limitReportText(text, maxChars = MAX_AI_MARKDOWN_CHARS) {
-  const value = String(text || "");
-  if (value.length <= maxChars) return value;
-  return (
-    value.slice(0, maxChars) +
-    "\n\n[Report truncated for storage safety. Full structured lap detail is stored in the reports/postSession/laps subcollection.]"
-  );
-}
-
-function compactReportZone(zone) {
-  return stripUndefinedDeep({
-    zoneId: zone.zoneId,
-    startLapDistanceM: zone.startLapDistanceM,
-    endLapDistanceM: zone.endLapDistanceM,
-    entrySpeedKph: zone.entrySpeedKph,
-    minSpeedKph: zone.minSpeedKph,
-    apexSpeedKph: zone.apexSpeedKph,
-    exitSpeedKph: zone.exitSpeedKph,
-    peakBrakePct: zone.peakBrakePct,
-    coastingAfterBrakeSec: zone.coastingAfterBrakeSec,
-    coastingPct: zone.coastingPct,
-    throttlePickupDelaySec: zone.throttlePickupDelaySec,
-    issueTags: Array.isArray(zone.issueTags) ? zone.issueTags.slice(0, 4) : [],
-    comparisonToBestLap: zone.comparisonToBestLap || null,
-  });
-}
-
-function compactLapForMainReport(lap) {
-  const importantBrakingZones = (lap.brakingZones || [])
-    .filter((zone) => (zone.issueTags || []).length || zone.comparisonToBestLap)
-    .slice(0, 3)
-    .map(compactReportZone);
-
-  const importantCorneringZones = (lap.corneringZones || [])
-    .filter((zone) => (zone.issueTags || []).length || zone.comparisonToBestLap)
-    .slice(0, 3)
-    .map(compactReportZone);
-
-  return stripUndefinedDeep({
-    lapNumber: lap.lapNumber,
-    sampleCount: lap.sampleCount,
-    lapTimeMs: lap.lapTimeMs,
-    lapTime: lap.lapTime,
-    sector1Ms: lap.sector1Ms,
-    sector2Ms: lap.sector2Ms,
-    sector3Ms: lap.sector3Ms,
-    valid: lap.valid,
-    avgSpeedKph: lap.avgSpeedKph,
-    maxSpeedKph: lap.maxSpeedKph,
-    fullThrottlePct: lap.fullThrottlePct,
-    heavyBrakePct: lap.heavyBrakePct,
-    coastingPct: lap.coastingPct,
-    throttleBrakeOverlapPct: lap.throttleBrakeOverlapPct,
-    avgAbsSteering: lap.avgAbsSteering,
-    steeringSmoothness: lap.steeringSmoothness,
-    brakingZoneCount: lap.brakingZoneCount,
-    corneringZoneCount: lap.corneringZoneCount,
-    importantBrakingZones,
-    importantCorneringZones,
-  });
-}
-
-function buildCompactPostSessionReport(report) {
-  return stripUndefinedDeep({
-    ...report,
-    lapSummaries: (report.lapSummaries || []).map(compactLapForMainReport),
-    precisionFindings: (report.precisionFindings || []).slice(0, MAX_REPORT_FINDINGS),
-    topCoachSignals: (report.topCoachSignals || []).slice(0, MAX_REPORT_SIGNALS),
-    aiReadableMarkdown: limitReportText(report.aiReadableMarkdown),
-    storageNote:
-      "Main report is compact to avoid Render/Firestore memory limits. Detailed braking and cornering evidence is stored in reports/postSession/laps.",
-  });
-}
-
-async function commitReportLapDetails(reportRef, lapSummaries, schema, sessionId) {
-  let batch = db.batch();
-  let writes = 0;
-  let totalWrites = 0;
-
-  for (const lap of (lapSummaries || []).slice(0, MAX_REPORT_LAP_DETAIL_DOCS)) {
-    const lapRef = reportRef.collection("laps").doc("lap_" + lap.lapNumber);
-
-    batch.set(lapRef, {
-      ...stripUndefinedDeep(lap),
-      schema,
-      sessionId,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-
-    writes += 1;
-    totalWrites += 1;
-
-    if (writes >= 400) {
-      await batch.commit();
-      batch = db.batch();
-      writes = 0;
-    }
-  }
-
-  if (writes > 0) {
-    await batch.commit();
-  }
-
-  return totalWrites;
 }
 
 async function buildAndSavePostSessionReport(sessionRef) {
@@ -2877,11 +2697,9 @@ async function buildAndSavePostSessionReport(sessionRef) {
   const reportPath = "sessions/" + sessionRef.id + "/reports/postSession";
   const reportRef = sessionRef.collection("reports").doc("postSession");
 
-  const mainReport = buildCompactPostSessionReport(report);
-
   await reportRef.set(
     stripUndefinedDeep({
-      ...mainReport,
+      ...report,
       reportPath,
       generatedAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
@@ -2889,12 +2707,17 @@ async function buildAndSavePostSessionReport(sessionRef) {
     { merge: false }
   );
 
-  const lapDetailDocCount = await commitReportLapDetails(
-    reportRef,
-    report.lapSummaries || [],
-    report.schema,
-    sessionRef.id
-  );
+  const batch = db.batch();
+  for (const lap of report.lapSummaries || []) {
+    const lapRef = reportRef.collection("laps").doc("lap_" + lap.lapNumber);
+    batch.set(lapRef, {
+      ...stripUndefinedDeep(lap),
+      schema: report.schema,
+      sessionId: sessionRef.id,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+  }
+  await batch.commit();
 
   await sessionRef.set(
     stripUndefinedDeep({
@@ -2908,7 +2731,6 @@ async function buildAndSavePostSessionReport(sessionRef) {
         lapCount: report.sessionSnapshot.lapCount,
         coachSignalCount: report.topCoachSignals.length,
         precisionFindingCount: report.precisionFindings.length,
-        lapDetailDocCount,
         brakingFindingCount: report.precisionFindings.filter((finding) => finding.type === "braking").length,
         cornerFindingCount: report.precisionFindings.filter((finding) => finding.type === "cornering").length,
         bestLap: report.bestLap,
@@ -2926,7 +2748,6 @@ async function buildAndSavePostSessionReport(sessionRef) {
     lapCount: report.sessionSnapshot.lapCount,
     coachSignalCount: report.topCoachSignals.length,
     precisionFindingCount: report.precisionFindings.length,
-    lapDetailDocCount,
     brakingFindingCount: report.precisionFindings.filter((finding) => finding.type === "braking").length,
     cornerFindingCount: report.precisionFindings.filter((finding) => finding.type === "cornering").length,
     bestLap: report.bestLap,

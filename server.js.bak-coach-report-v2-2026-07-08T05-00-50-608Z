@@ -8,7 +8,7 @@ import crypto from "crypto";
 
 import { initializeApp, applicationDefault, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-import { getFirestore, FieldValue, FieldPath } from "firebase-admin/firestore";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 dotenv.config();
 
@@ -1675,15 +1675,7 @@ app.patch("/sessions/:id", async (req, res) => {
 });
 
 // POST_SESSION_AI_REPORT_START
-const POST_SESSION_REPORT_SCHEMA = "f1-coach-evidence-report-v2";
-const REPORT_TELEMETRY_CHUNK_PAGE_SIZE = Number(process.env.POST_SESSION_CHUNK_PAGE_SIZE || 20);
-const MAX_REPORT_SAMPLES_PER_LAP = Number(process.env.POST_SESSION_MAX_SAMPLES_PER_LAP || 450);
-const MAX_REPORT_TOTAL_SAMPLES = Number(process.env.POST_SESSION_MAX_TOTAL_SAMPLES || 6000);
-const MAX_REPORT_LAP_DETAIL_DOCS = Number(process.env.POST_SESSION_MAX_LAP_DETAIL_DOCS || 120);
-const MAX_REPORT_FINDINGS = Number(process.env.POST_SESSION_MAX_FINDINGS || 16);
-const MAX_REPORT_SIGNALS = Number(process.env.POST_SESSION_MAX_SIGNALS || 14);
-const MAX_MARKDOWN_LAPS = Number(process.env.POST_SESSION_MAX_MARKDOWN_LAPS || 12);
-const MAX_AI_MARKDOWN_CHARS = Number(process.env.POST_SESSION_MAX_MARKDOWN_CHARS || 180000);
+const POST_SESSION_REPORT_SCHEMA = "f1-post-session-ai-report-v1";
 
 function reportRound(value, digits = 2) {
   if (value === null || value === undefined) return null;
@@ -1735,14 +1727,6 @@ function reportDurationSec(samples) {
   return Math.max(0, (Math.max(...times) - Math.min(...times)) / 1000);
 }
 
-function reportDurationBetween(a, b, fallbackSampleCount = null) {
-  const at = reportTimestampMs(a?.timestamp);
-  const bt = reportTimestampMs(b?.timestamp);
-  if (at !== null && bt !== null) return Math.max(0, (bt - at) / 1000);
-  if (fallbackSampleCount !== null) return Math.max(0, fallbackSampleCount * 0.1);
-  return null;
-}
-
 function reportDistanceSpan(samples, key = "lapDistance") {
   const distances = samples.map((sample) => finiteNumberOrNull(sample[key])).filter((value) => value !== null);
   if (!distances.length) return null;
@@ -1786,9 +1770,6 @@ function normalizeReportSample(raw, fallbackIndex) {
     lapNumber: parseInteger(raw?.lapNumber, null),
     lapDistance: finiteNumberOrNull(raw?.lapDistance),
     totalDistance: finiteNumberOrNull(raw?.totalDistance),
-    worldX: finiteNumberOrNull(raw?.worldX),
-    worldY: finiteNumberOrNull(raw?.worldY),
-    worldZ: finiteNumberOrNull(raw?.worldZ),
     speedKph: finiteNumberOrNull(raw?.speedKph),
     throttle: finiteNumberOrNull(raw?.throttle),
     brake: finiteNumberOrNull(raw?.brake),
@@ -1817,86 +1798,29 @@ function sortReportSamples(samples) {
   });
 }
 
-function downsampleReportSamples(samples, maxSamples) {
-  if (!Array.isArray(samples) || samples.length <= maxSamples) return samples;
-  if (maxSamples <= 0) return [];
-
-  const out = [];
-  const step = (samples.length - 1) / Math.max(1, maxSamples - 1);
-
-  for (let i = 0; i < maxSamples; i += 1) {
-    out.push(samples[Math.round(i * step)]);
-  }
-
-  return out;
-}
-
 async function collectSessionTelemetrySamples(sessionRef) {
-  const samplesByLap = new Map();
-  let fallbackIndex = 0;
-  let rawSampleCount = 0;
-  let lastDoc = null;
-
-  while (true) {
-    let queryRef = sessionRef
-      .collection("telemetryChunks")
-      .orderBy(FieldPath.documentId())
-      .limit(REPORT_TELEMETRY_CHUNK_PAGE_SIZE);
-
-    if (lastDoc) {
-      queryRef = queryRef.startAfter(lastDoc);
-    }
-
-    const chunksSnap = await queryRef.get();
-    if (chunksSnap.empty) break;
-
-    for (const doc of chunksSnap.docs) {
-      const data = doc.data() || {};
-      const chunkSamples = Array.isArray(data.samples) ? data.samples : [];
-
-      for (const sample of chunkSamples) {
-        fallbackIndex += 1;
-        rawSampleCount += 1;
-
-        const normalized = normalizeReportSample(sample, fallbackIndex);
-        const hasDrivingData =
-          normalized.speedKph !== null ||
-          normalized.throttle !== null ||
-          normalized.brake !== null ||
-          normalized.steering !== null;
-
-        if (!hasDrivingData) continue;
-
-        const lapKey = normalized.lapNumber === null ? "unknown" : String(normalized.lapNumber);
-        if (!samplesByLap.has(lapKey)) samplesByLap.set(lapKey, []);
-
-        const bucket = samplesByLap.get(lapKey);
-        bucket.push(normalized);
-
-        if (bucket.length > Math.ceil(MAX_REPORT_SAMPLES_PER_LAP * 1.5)) {
-          samplesByLap.set(lapKey, downsampleReportSamples(bucket, MAX_REPORT_SAMPLES_PER_LAP));
-        }
-      }
-    }
-
-    lastDoc = chunksSnap.docs[chunksSnap.docs.length - 1];
-    if (chunksSnap.size < REPORT_TELEMETRY_CHUNK_PAGE_SIZE) break;
-  }
-
+  const chunksSnap = await sessionRef.collection("telemetryChunks").get();
   const samples = [];
-  for (const bucket of samplesByLap.values()) {
-    samples.push(...downsampleReportSamples(bucket, MAX_REPORT_SAMPLES_PER_LAP));
+  let fallbackIndex = 0;
+
+  for (const doc of chunksSnap.docs) {
+    const data = doc.data() || {};
+    const chunkSamples = Array.isArray(data.samples) ? data.samples : [];
+
+    for (const sample of chunkSamples) {
+      fallbackIndex += 1;
+      const normalized = normalizeReportSample(sample, fallbackIndex);
+      const hasDrivingData =
+        normalized.speedKph !== null ||
+        normalized.throttle !== null ||
+        normalized.brake !== null ||
+        normalized.steering !== null;
+
+      if (hasDrivingData) samples.push(normalized);
+    }
   }
 
-  const sorted = sortReportSamples(samples);
-  const capped = downsampleReportSamples(sorted, MAX_REPORT_TOTAL_SAMPLES);
-
-  Object.defineProperty(capped, "rawSampleCount", {
-    value: rawSampleCount,
-    enumerable: false,
-  });
-
-  return capped;
+  return sortReportSamples(samples);
 }
 
 async function collectSessionLapDocs(sessionRef) {
@@ -1951,161 +1875,24 @@ function reportLongestRun(samples, predicate) {
   return best;
 }
 
-function reportSliceUntil(samples, predicate) {
-  const out = [];
-  for (const sample of samples) {
-    if (predicate(sample)) break;
-    out.push(sample);
-  }
-  return out;
-}
-
-function reportSteeringSmoothness(samples) {
-  if (samples.length < 2) return null;
-  let totalChange = 0;
-  let count = 0;
-  for (let i = 1; i < samples.length; i += 1) {
-    const prev = finiteNumberOrNull(samples[i - 1].steering);
-    const curr = finiteNumberOrNull(samples[i].steering);
-    if (prev === null || curr === null) continue;
-    totalChange += Math.abs(curr - prev);
-    count += 1;
-  }
-  return count ? totalChange / count : null;
-}
-
-function reportAttachLapIndexes(samples) {
-  return samples.map((sample, index) => ({
-    ...sample,
-    lapSampleIndex: index,
-  }));
-}
-
-function summarizeBrakingZone(run, lapSamples, zoneIndex) {
+function summarizeReportRun(run) {
   const speeds = run.map((sample) => sample.speedKph).filter((value) => value !== null);
   const brakes = run.map((sample) => sample.brake).filter((value) => value !== null);
   const throttles = run.map((sample) => sample.throttle).filter((value) => value !== null);
   const steerings = run.map((sample) => Math.abs(sample.steering ?? 0));
-  const startIndex = run[0]?.lapSampleIndex ?? 0;
-  const endIndex = run[run.length - 1]?.lapSampleIndex ?? startIndex;
-  const before = lapSamples.slice(Math.max(0, startIndex - 6), startIndex);
-  const after = lapSamples.slice(endIndex + 1, Math.min(lapSamples.length, endIndex + 26));
-  const approachSample = before.length ? before[before.length - 1] : run[0];
-  const releaseSample = run[run.length - 1];
-  const throttlePickupSample = after.find((sample) => (sample.throttle ?? 0) >= 0.4) || null;
-  const firstPositiveThrottleSample = after.find((sample) => (sample.throttle ?? 0) >= 0.1) || null;
-  const coastAfterBrakeSamples = reportSliceUntil(after, (sample) => (sample.throttle ?? 0) >= 0.1 || (sample.brake ?? 0) >= 0.05);
-  const trailBrakeSamples = run.filter((sample) => Math.abs(sample.steering ?? 0) >= 0.25 && (sample.brake ?? 0) >= 0.05 && (sample.brake ?? 0) <= 0.75);
-  const overlapWindow = lapSamples.slice(startIndex, Math.min(lapSamples.length, endIndex + 12));
-  const overlapSamples = overlapWindow.filter((sample) => (sample.throttle ?? 0) >= 0.1 && (sample.brake ?? 0) >= 0.1);
-  const minSpeed = speeds.length ? Math.min(...speeds) : null;
-  const entrySpeed = reportRound(run[0]?.speedKph, 1);
-  const approachSpeed = reportRound(approachSample?.speedKph, 1);
-  const exitSpeed = reportRound((throttlePickupSample || releaseSample)?.speedKph, 1);
-  const speedDrop = approachSpeed !== null && minSpeed !== null ? approachSpeed - minSpeed : null;
-  const issueTags = [];
-
-  const coastingAfterBrakeSec = reportRound(reportDurationSec(coastAfterBrakeSamples), 2);
-  const throttlePickupDelaySec = throttlePickupSample
-    ? reportRound(reportDurationBetween(releaseSample, throttlePickupSample, Math.max(0, throttlePickupSample.lapSampleIndex - releaseSample.lapSampleIndex)), 2)
-    : null;
-  const overlapDurationSec = reportRound(reportDurationSec(overlapSamples), 2);
-  const durationSec = reportRound(reportDurationSec(run), 2);
-
-  if ((coastingAfterBrakeSec ?? 0) >= 0.35) issueTags.push("delayed throttle after brake release");
-  if ((overlapDurationSec ?? 0) >= 0.25) issueTags.push("brake/throttle overlap");
-  if ((durationSec ?? 0) >= 1.7) issueTags.push("long braking phase");
-  if ((speedDrop ?? 0) >= 135) issueTags.push("large speed drop");
-  if ((trailBrakeSamples.length / Math.max(1, run.length)) < 0.12 && steerings.some((value) => value >= 0.35)) {
-    issueTags.push("little trail braking into steering phase");
-  }
 
   return stripUndefinedDeep({
-    zoneId: "BZ-" + String(zoneIndex).padStart(2, "0"),
-    zoneType: "braking",
     startLapDistanceM: reportRound(run[0]?.lapDistance, 1),
-    endLapDistanceM: reportRound(releaseSample?.lapDistance, 1),
-    releaseLapDistanceM: reportRound(releaseSample?.lapDistance, 1),
-    throttlePickupLapDistanceM: reportRound(throttlePickupSample?.lapDistance ?? firstPositiveThrottleSample?.lapDistance, 1),
-    distanceM: reportRound(reportDistanceSpan(run), 1),
-    durationSec,
-    approachSpeedKph: reportRound(approachSpeed, 1),
-    entrySpeedKph: reportRound(entrySpeed, 1),
-    minSpeedKph: reportRound(minSpeed, 1),
-    releaseSpeedKph: reportRound(releaseSample?.speedKph, 1),
-    throttlePickupSpeedKph: reportRound(throttlePickupSample?.speedKph ?? firstPositiveThrottleSample?.speedKph, 1),
-    exitSpeedKph: exitSpeed,
-    speedDropKph: reportRound(speedDrop, 1),
-    peakBrakePct: reportRound((brakes.length ? Math.max(...brakes) : 0) * 100, 1),
-    avgBrakePct: reportRound((reportAvg(brakes) ?? 0) * 100, 1),
-    avgThrottlePctDuringBrake: reportRound((reportAvg(throttles) ?? 0) * 100, 1),
-    peakAbsSteeringDuringBrake: reportRound(steerings.length ? Math.max(...steerings) : null, 3),
-    trailBrakePctOfZone: reportRound((trailBrakeSamples.length / Math.max(1, run.length)) * 100, 1),
-    coastingAfterBrakeSec,
-    coastingAfterBrakeDistanceM: reportRound(reportDistanceSpan(coastAfterBrakeSamples), 1),
-    throttlePickupDelaySec,
-    overlapDurationSec,
-    issueTags,
-  });
-}
-
-function summarizeCornerZone(run, lapSamples, zoneIndex) {
-  const speeds = run.map((sample) => sample.speedKph).filter((value) => value !== null);
-  const throttles = run.map((sample) => sample.throttle).filter((value) => value !== null);
-  const brakes = run.map((sample) => sample.brake).filter((value) => value !== null);
-  const steerings = run.map((sample) => Math.abs(sample.steering ?? 0));
-  const startIndex = run[0]?.lapSampleIndex ?? 0;
-  const endIndex = run[run.length - 1]?.lapSampleIndex ?? startIndex;
-  const after = lapSamples.slice(endIndex + 1, Math.min(lapSamples.length, endIndex + 18));
-  const apexSample = [...run].sort((a, b) => (a.speedKph ?? 9999) - (b.speedKph ?? 9999))[0] || run[Math.floor(run.length / 2)];
-  const throttlePickupSample = [...run, ...after].find((sample) => (sample.throttle ?? 0) >= 0.4) || null;
-  const overlapSamples = run.filter((sample) => (sample.throttle ?? 0) >= 0.1 && (sample.brake ?? 0) >= 0.1);
-  const coastingSamples = run.filter((sample) => (sample.throttle ?? 0) < 0.05 && (sample.brake ?? 0) < 0.05);
-  const exitSample = after.find((sample) => (sample.throttle ?? 0) >= 0.4) || run[run.length - 1];
-  const speedDrop = run[0]?.speedKph !== null && apexSample?.speedKph !== null ? run[0].speedKph - apexSample.speedKph : null;
-  const issueTags = [];
-  const coastingPct = reportRound((coastingSamples.length / Math.max(1, run.length)) * 100, 1);
-  const overlapDurationSec = reportRound(reportDurationSec(overlapSamples), 2);
-  const throttlePickupDelaySec = throttlePickupSample
-    ? reportRound(reportDurationBetween(apexSample, throttlePickupSample, Math.max(0, throttlePickupSample.lapSampleIndex - apexSample.lapSampleIndex)), 2)
-    : null;
-  const peakAbsSteering = steerings.length ? Math.max(...steerings) : null;
-  const steeringSmoothness = reportRound(reportSteeringSmoothness(run), 4);
-
-  if ((coastingPct ?? 0) >= 25) issueTags.push("coasting through corner");
-  if ((throttlePickupDelaySec ?? 0) >= 0.45) issueTags.push("late throttle pickup after apex");
-  if ((overlapDurationSec ?? 0) >= 0.25) issueTags.push("pedal overlap in corner");
-  if ((peakAbsSteering ?? 0) >= 0.85) issueTags.push("high steering angle");
-  if ((steeringSmoothness ?? 0) >= 0.09) issueTags.push("abrupt steering changes");
-  if ((speedDrop ?? 0) >= 85) issueTags.push("large corner speed drop");
-
-  return stripUndefinedDeep({
-    zoneId: "CZ-" + String(zoneIndex).padStart(2, "0"),
-    zoneType: "cornering",
-    startLapDistanceM: reportRound(run[0]?.lapDistance, 1),
-    apexLapDistanceM: reportRound(apexSample?.lapDistance, 1),
     endLapDistanceM: reportRound(run[run.length - 1]?.lapDistance, 1),
-    throttlePickupLapDistanceM: reportRound(throttlePickupSample?.lapDistance, 1),
-    distanceM: reportRound(reportDistanceSpan(run), 1),
     durationSec: reportRound(reportDurationSec(run), 2),
-    entrySpeedKph: reportRound(run[0]?.speedKph, 1),
-    apexSpeedKph: reportRound(apexSample?.speedKph, 1),
+    distanceM: reportRound(reportDistanceSpan(run), 1),
+    entrySpeedKph: reportRound(speeds[0], 1),
     minSpeedKph: speeds.length ? reportRound(Math.min(...speeds), 1) : null,
-    exitSpeedKph: reportRound(exitSample?.speedKph, 1),
-    speedDropKph: reportRound(speedDrop, 1),
+    exitSpeedKph: reportRound(speeds[speeds.length - 1], 1),
     avgSpeedKph: reportRound(reportAvg(speeds), 1),
+    peakBrakePct: reportRound((brakes.length ? Math.max(...brakes) : 0) * 100, 1),
     avgThrottlePct: reportRound((reportAvg(throttles) ?? 0) * 100, 1),
-    throttleAtApexPct: reportRound((apexSample?.throttle ?? 0) * 100, 1),
-    throttleAtExitPct: reportRound((exitSample?.throttle ?? 0) * 100, 1),
-    avgBrakePct: reportRound((reportAvg(brakes) ?? 0) * 100, 1),
-    brakeAtApexPct: reportRound((apexSample?.brake ?? 0) * 100, 1),
-    peakAbsSteering: reportRound(peakAbsSteering, 3),
-    avgAbsSteering: reportRound(reportAvg(steerings), 3),
-    steeringSmoothness,
-    coastingPct,
-    overlapDurationSec,
-    throttlePickupDelaySec,
-    issueTags,
+    peakAbsSteering: reportRound(steerings.length ? Math.max(...steerings) : null, 3),
   });
 }
 
@@ -2124,70 +1911,7 @@ function summarizeReportCornersForLap(corners) {
   );
 }
 
-function findReferenceZone(zone, referenceZones, maxDistanceM = 90) {
-  if (!zone || !Array.isArray(referenceZones) || !referenceZones.length) return null;
-  const start = finiteNumberOrNull(zone.startLapDistanceM);
-  if (start === null) return null;
-
-  let best = null;
-  let bestDistance = Infinity;
-
-  for (const candidate of referenceZones) {
-    const candidateStart = finiteNumberOrNull(candidate.startLapDistanceM);
-    if (candidateStart === null) continue;
-    const distance = Math.abs(candidateStart - start);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      best = candidate;
-    }
-  }
-
-  return best && bestDistance <= maxDistanceM ? best : null;
-}
-
-function addZoneComparisons(lapSummaries, bestLapNumber) {
-  const bestLap = lapSummaries.find((lap) => lap.lapNumber === bestLapNumber) || null;
-  if (!bestLap) return lapSummaries;
-
-  for (const lap of lapSummaries) {
-    for (const zone of lap.brakingZones || []) {
-      const ref = findReferenceZone(zone, bestLap.brakingZones || []);
-      if (!ref || lap.lapNumber === bestLapNumber) continue;
-      zone.comparisonToBestLap = stripUndefinedDeep({
-        referenceLap: bestLapNumber,
-        referenceZoneId: ref.zoneId,
-        deltaDurationSec: reportRound((zone.durationSec ?? 0) - (ref.durationSec ?? 0), 2),
-        deltaMinSpeedKph: reportRound((zone.minSpeedKph ?? 0) - (ref.minSpeedKph ?? 0), 1),
-        deltaExitSpeedKph: reportRound((zone.exitSpeedKph ?? 0) - (ref.exitSpeedKph ?? 0), 1),
-        deltaThrottlePickupDelaySec: zone.throttlePickupDelaySec !== null && ref.throttlePickupDelaySec !== null
-          ? reportRound(zone.throttlePickupDelaySec - ref.throttlePickupDelaySec, 2)
-          : null,
-        deltaCoastingAfterBrakeSec: zone.coastingAfterBrakeSec !== null && ref.coastingAfterBrakeSec !== null
-          ? reportRound(zone.coastingAfterBrakeSec - ref.coastingAfterBrakeSec, 2)
-          : null,
-      });
-    }
-
-    for (const zone of lap.corneringZones || []) {
-      const ref = findReferenceZone(zone, bestLap.corneringZones || []);
-      if (!ref || lap.lapNumber === bestLapNumber) continue;
-      zone.comparisonToBestLap = stripUndefinedDeep({
-        referenceLap: bestLapNumber,
-        referenceZoneId: ref.zoneId,
-        deltaApexSpeedKph: reportRound((zone.apexSpeedKph ?? 0) - (ref.apexSpeedKph ?? 0), 1),
-        deltaExitSpeedKph: reportRound((zone.exitSpeedKph ?? 0) - (ref.exitSpeedKph ?? 0), 1),
-        deltaThrottleAtApexPct: reportRound((zone.throttleAtApexPct ?? 0) - (ref.throttleAtApexPct ?? 0), 1),
-        deltaCoastingPct: reportRound((zone.coastingPct ?? 0) - (ref.coastingPct ?? 0), 1),
-        deltaPeakAbsSteering: reportRound((zone.peakAbsSteering ?? 0) - (ref.peakAbsSteering ?? 0), 3),
-      });
-    }
-  }
-
-  return lapSummaries;
-}
-
-function summarizeReportLap(lapNumber, rawSamples, lapDoc, corners) {
-  const samples = reportAttachLapIndexes(rawSamples);
+function summarizeReportLap(lapNumber, samples, lapDoc, corners) {
   const speeds = samples.map((sample) => sample.speedKph).filter((value) => value !== null);
   const throttles = samples.map((sample) => sample.throttle).filter((value) => value !== null);
   const brakes = samples.map((sample) => sample.brake).filter((value) => value !== null);
@@ -2222,176 +1946,25 @@ function summarizeReportLap(lapNumber, rawSamples, lapDoc, corners) {
     longestCoastSec: reportRound(reportDurationSec(coastRun), 2),
     avgAbsSteering: reportRound(reportAvg(steerings.map((value) => Math.abs(value))), 3),
     maxAbsSteering: steerings.length ? reportRound(Math.max(...steerings.map((value) => Math.abs(value))), 3) : null,
-    steeringSmoothness: reportRound(reportSteeringSmoothness(samples), 4),
     drsPct: reportRound(reportRatio(samples, (sample) => sample.drs === true), 1),
     bestDeltaToPbMs: deltas.length ? reportRound(Math.min(...deltas), 1) : null,
     finalDeltaToPbMs: deltas.length ? reportRound(deltas[deltas.length - 1], 1) : null,
     brakingZoneCount: brakingRuns.length,
     corneringZoneCount: cornerRuns.length,
-    brakingZones: brakingRuns.slice(0, 12).map((run, index) => summarizeBrakingZone(run, samples, index + 1)),
-    corneringZones: cornerRuns.slice(0, 12).map((run, index) => summarizeCornerZone(run, samples, index + 1)),
+    brakingZones: brakingRuns.slice(0, 8).map(summarizeReportRun),
+    corneringZones: cornerRuns.slice(0, 8).map(summarizeReportRun),
     savedCorners: summarizeReportCornersForLap(corners),
   });
 }
 
-function buildDataQuality(samples, laps, corners) {
-  const timedLaps = laps.filter((lap) => parseInteger(lap.lapTimeMs, null) !== null);
-  const validTimedLaps = timedLaps.filter((lap) => lap.valid !== false);
-  const sectorRows = timedLaps.filter((lap) => lap.sector1Ms != null || lap.sector2Ms != null || lap.sector3Ms != null);
-  const hasWorld = samples.some((sample) => sample.worldX !== null && sample.worldZ !== null);
-  const pedalSamples = samples.filter((sample) => sample.throttle !== null && sample.brake !== null).length;
-  const steeringSamples = samples.filter((sample) => sample.steering !== null).length;
-  const distanceSamples = samples.filter((sample) => sample.lapDistance !== null).length;
-  let confidence = "low";
-
-  if (samples.length >= 300 && validTimedLaps.length >= 1 && pedalSamples / Math.max(1, samples.length) >= 0.8) {
-    confidence = "high";
-  } else if (samples.length >= 80 && timedLaps.length >= 1) {
-    confidence = "medium";
-  }
-
-  return {
-    confidence,
-    sampleCount: samples.length,
-    timedLapCount: timedLaps.length,
-    validTimedLapCount: validTimedLaps.length,
-    sectorLapCount: sectorRows.length,
-    cornerEventCount: corners.length,
-    pedalCoveragePct: reportRound((pedalSamples / Math.max(1, samples.length)) * 100, 1),
-    steeringCoveragePct: reportRound((steeringSamples / Math.max(1, samples.length)) * 100, 1),
-    lapDistanceCoveragePct: reportRound((distanceSamples / Math.max(1, samples.length)) * 100, 1),
-    worldPositionAvailable: hasWorld,
-    limitations: [
-      ...(samples.length < 80 ? ["low telemetry sample count"] : []),
-      ...(timedLaps.length === 0 ? ["no official lap timing rows"] : []),
-      ...(sectorRows.length === 0 ? ["sector timing unavailable"] : []),
-      ...(distanceSamples === 0 ? ["lap distance unavailable, zone positions less precise"] : []),
-      ...(!hasWorld ? ["world position unavailable, map/corner matching is distance-based only"] : []),
-    ],
-  };
-}
-
-function buildLapComparisonTable(lapSummaries, bestLap) {
-  return lapSummaries.map((lap) => ({
-    lapNumber: lap.lapNumber,
-    valid: lap.valid !== false,
-    lapTimeMs: lap.lapTimeMs,
-    lapTime: lap.lapTime,
-    gapToBestMs: bestLap && lap.lapTimeMs !== null ? lap.lapTimeMs - bestLap.lapTimeMs : null,
-    avgSpeedKph: lap.avgSpeedKph,
-    maxSpeedKph: lap.maxSpeedKph,
-    fullThrottlePct: lap.fullThrottlePct,
-    heavyBrakePct: lap.heavyBrakePct,
-    coastingPct: lap.coastingPct,
-    throttleBrakeOverlapPct: lap.throttleBrakeOverlapPct,
-    avgAbsSteering: lap.avgAbsSteering,
-    brakingZoneCount: lap.brakingZoneCount,
-    corneringZoneCount: lap.corneringZoneCount,
-  }));
-}
-
-function scoreBrakingZone(zone) {
-  let score = 0;
-  if ((zone.coastingAfterBrakeSec ?? 0) >= 0.35) score += 3;
-  if ((zone.overlapDurationSec ?? 0) >= 0.25) score += 3;
-  if ((zone.comparisonToBestLap?.deltaExitSpeedKph ?? 0) <= -8) score += 4;
-  if ((zone.comparisonToBestLap?.deltaMinSpeedKph ?? 0) <= -8) score += 3;
-  if ((zone.comparisonToBestLap?.deltaDurationSec ?? 0) >= 0.3) score += 2;
-  if ((zone.speedDropKph ?? 0) >= 135) score += 1;
-  return score;
-}
-
-function scoreCornerZone(zone) {
-  let score = 0;
-  if ((zone.coastingPct ?? 0) >= 25) score += 3;
-  if ((zone.throttlePickupDelaySec ?? 0) >= 0.45) score += 3;
-  if ((zone.comparisonToBestLap?.deltaExitSpeedKph ?? 0) <= -8) score += 4;
-  if ((zone.comparisonToBestLap?.deltaApexSpeedKph ?? 0) <= -8) score += 3;
-  if ((zone.peakAbsSteering ?? 0) >= 0.85) score += 1;
-  if ((zone.steeringSmoothness ?? 0) >= 0.09) score += 1;
-  return score;
-}
-
-function buildPrecisionFindings(lapSummaries, bestLap) {
-  const findings = [];
-
-  for (const lap of lapSummaries) {
-    for (const zone of lap.brakingZones || []) {
-      const score = scoreBrakingZone(zone);
-      if (!score && !(zone.issueTags || []).length) continue;
-      findings.push({
-        type: "braking",
-        severity: score >= 7 ? "high" : score >= 4 ? "medium" : "low",
-        score,
-        lapNumber: lap.lapNumber,
-        zoneId: zone.zoneId,
-        location: reportFormatNumber(zone.startLapDistanceM, 1, " m") + " to " + reportFormatNumber(zone.endLapDistanceM, 1, " m"),
-        evidence:
-          "Entry " + reportFormatNumber(zone.entrySpeedKph, 0, " kph") +
-          ", min " + reportFormatNumber(zone.minSpeedKph, 0, " kph") +
-          ", exit " + reportFormatNumber(zone.exitSpeedKph, 0, " kph") +
-          ", peak brake " + reportFormatPct(zone.peakBrakePct) +
-          ", coast after brake " + reportFormatNumber(zone.coastingAfterBrakeSec, 2, " sec") +
-          (zone.comparisonToBestLap?.deltaExitSpeedKph != null ? ", exit vs best " + reportFormatNumber(zone.comparisonToBestLap.deltaExitSpeedKph, 1, " kph") : ""),
-        interpretation: (zone.issueTags || []).join(", ") || "braking zone differs from best-lap reference",
-        coachingTip:
-          (zone.comparisonToBestLap?.deltaExitSpeedKph ?? 0) <= -8
-            ? "Prioritize exit speed here: release the brake earlier/smoother and pick up throttle sooner after rotation."
-            : (zone.coastingAfterBrakeSec ?? 0) >= 0.35
-              ? "Reduce the dead time after brake release. Aim for a smoother brake release directly into maintenance throttle."
-              : "Review braking pressure and release shape; avoid holding peak brake longer than needed.",
-      });
-    }
-
-    for (const zone of lap.corneringZones || []) {
-      const score = scoreCornerZone(zone);
-      if (!score && !(zone.issueTags || []).length) continue;
-      findings.push({
-        type: "cornering",
-        severity: score >= 7 ? "high" : score >= 4 ? "medium" : "low",
-        score,
-        lapNumber: lap.lapNumber,
-        zoneId: zone.zoneId,
-        location: reportFormatNumber(zone.startLapDistanceM, 1, " m") + " to " + reportFormatNumber(zone.endLapDistanceM, 1, " m"),
-        evidence:
-          "Apex " + reportFormatNumber(zone.apexSpeedKph, 0, " kph") +
-          ", exit " + reportFormatNumber(zone.exitSpeedKph, 0, " kph") +
-          ", throttle at apex " + reportFormatPct(zone.throttleAtApexPct) +
-          ", coasting " + reportFormatPct(zone.coastingPct) +
-          (zone.comparisonToBestLap?.deltaExitSpeedKph != null ? ", exit vs best " + reportFormatNumber(zone.comparisonToBestLap.deltaExitSpeedKph, 1, " kph") : ""),
-        interpretation: (zone.issueTags || []).join(", ") || "corner phase differs from best-lap reference",
-        coachingTip:
-          (zone.throttlePickupDelaySec ?? 0) >= 0.45 || (zone.coastingPct ?? 0) >= 25
-            ? "Work on earlier throttle commitment after apex. If the car pushes wide, slow the entry slightly less abruptly and rotate before throttle."
-            : (zone.peakAbsSteering ?? 0) >= 0.85
-              ? "Smooth the steering trace and avoid adding extra lock while asking for throttle."
-              : "Compare this corner to the best lap and aim to keep minimum speed and exit throttle closer to the reference.",
-      });
-    }
-  }
-
-  return findings.sort((a, b) => b.score - a.score).slice(0, 16);
-}
-
-function buildPostSessionCoachSignals(lapSummaries, precisionFindings, bestLap) {
+function buildPostSessionCoachSignals(laps) {
   const signals = [];
 
-  function add(severity, area, lap, evidence, coachingAngle, linkedZone = null) {
-    signals.push(stripUndefinedDeep({ severity, area, lap, evidence, coachingAngle, linkedZone }));
+  function add(severity, area, lap, evidence, coachingAngle) {
+    signals.push({ severity, area, lap, evidence, coachingAngle });
   }
 
-  for (const finding of precisionFindings.slice(0, 10)) {
-    add(
-      finding.severity,
-      finding.type === "braking" ? "braking technique" : "corner exit technique",
-      finding.lapNumber,
-      finding.zoneId + " at " + finding.location + ": " + finding.evidence + ". " + finding.interpretation + ".",
-      finding.coachingTip,
-      finding.zoneId
-    );
-  }
-
-  for (const lap of lapSummaries) {
+  for (const lap of laps) {
     const label = "Lap " + lap.lapNumber;
 
     if ((lap.throttleBrakeOverlapPct ?? 0) >= 3) {
@@ -2400,7 +1973,7 @@ function buildPostSessionCoachSignals(lapSummaries, precisionFindings, bestLap) 
         "pedal overlap",
         lap.lapNumber,
         label + ": throttle and brake overlap for " + reportFormatPct(lap.throttleBrakeOverlapPct) + " of telemetry samples.",
-        "Avoid carrying throttle while still braking unless it is deliberate stabilization. It usually costs exit speed and heats tyres."
+        "Check whether the driver is dragging brake while already applying throttle. This usually hurts corner exits and tyre temperature."
       );
     }
 
@@ -2410,7 +1983,7 @@ function buildPostSessionCoachSignals(lapSummaries, precisionFindings, bestLap) 
         "coasting",
         lap.lapNumber,
         label + ": coasting for " + reportFormatPct(lap.coastingPct) + " of telemetry samples.",
-        "Find places where brake release is not followed by throttle. Coach the driver to connect brake release, rotation, and throttle pickup."
+        "Find places where the driver is neither braking nor accelerating. These are good targets for later braking, smoother release, or earlier throttle."
       );
     }
 
@@ -2430,97 +2003,83 @@ function buildPostSessionCoachSignals(lapSummaries, precisionFindings, bestLap) 
         "braking load",
         lap.lapNumber,
         label + ": heavy braking for " + reportFormatPct(lap.heavyBrakePct) + " of telemetry samples.",
-        "Review whether the driver is holding high brake pressure too long instead of releasing smoothly into the corner."
+        "Review braking zones for over-slowing, braking too long, or missing the trail-brake release."
+      );
+    }
+
+    if ((lap.maxAbsSteering ?? 0) >= 0.85 && (lap.avgSpeedKph ?? 0) > 90) {
+      add(
+        "low",
+        "steering smoothness",
+        lap.lapNumber,
+        label + ": peak steering reached " + reportFormatNumber(lap.maxAbsSteering, 3) + ".",
+        "Look for abrupt steering inputs at medium/high speed. Smoother steering can stabilize exits and preserve tyre grip."
       );
     }
   }
 
-  const unique = [];
-  const seen = new Set();
-  for (const signal of signals) {
-    const key = signal.area + "|" + signal.lap + "|" + (signal.linkedZone || signal.evidence);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(signal);
-  }
-
-  return unique.slice(0, 18);
+  return signals.slice(0, 18);
 }
 
 function renderPostSessionMarkdown(report) {
   const s = report.sessionSnapshot;
   const lines = [
-    "# F1 25 Coach Evidence Report",
+    "# F1 25 Post-Session AI Telemetry Report",
     "",
-    "This report is optimized for an AI racing coach. It separates measured evidence from coaching interpretation and includes braking/cornering zone detail.",
+    "This report is compact and AI-readable. It summarizes the session instead of dumping raw telemetry rows.",
     "",
-    "## 1. AI Instructions",
+    "## Session Snapshot",
     "",
-    "- Use only this report as evidence.",
-    "- Separate facts from guesses.",
-    "- Prefer advice backed by braking-zone or corner-zone evidence.",
-    "- If data quality is limited, lower confidence instead of overclaiming.",
-    "",
-    "## 2. Data Quality",
-    "",
-    "- Confidence: " + report.dataQuality.confidence,
-    "- Samples recorded: " + report.dataQuality.sampleCount,
-    "- Timed laps: " + report.dataQuality.timedLapCount,
-    "- Valid timed laps: " + report.dataQuality.validTimedLapCount,
-    "- Sector laps: " + report.dataQuality.sectorLapCount,
-    "- Pedal coverage: " + reportFormatPct(report.dataQuality.pedalCoveragePct),
-    "- Steering coverage: " + reportFormatPct(report.dataQuality.steeringCoveragePct),
-    "- Lap-distance coverage: " + reportFormatPct(report.dataQuality.lapDistanceCoveragePct),
-    "- World position available: " + (report.dataQuality.worldPositionAvailable ? "yes" : "no"),
-    "- Limitations: " + (report.dataQuality.limitations.length ? report.dataQuality.limitations.join("; ") : "none detected"),
-    "",
-    "## 3. Session Context",
-    "",
+    "- Schema: " + report.schema,
+    "- Status: " + report.status,
     "- Session ID: " + s.sessionId,
     "- Driver: " + (s.username || "-"),
     "- Track: " + (s.trackName || "-"),
     "- Session type: " + (s.sessionType ?? "-"),
-    "- Started: " + (s.startedAt || "-"),
-    "- Ended: " + (s.endedAt || "-"),
-    "",
-    "## 4. Session Summary",
-    "",
-    "- Best lap: " + (report.bestLap?.lapTime || "-") + (report.bestLap ? " on lap " + report.bestLap.lapNumber : ""),
-    "- Worst valid lap: " + (report.worstLap?.lapTime || "-") + (report.worstLap ? " on lap " + report.worstLap.lapNumber : ""),
-    "- Top speed: " + reportFormatNumber(s.topSpeedKph, 0, " kph"),
+    "- Samples analysed: " + s.sampleCount,
+    "- Laps detected: " + s.lapCount,
+    "- Best lap: " + (s.bestLap?.lapTime || "-") + (s.bestLap ? " on lap " + s.bestLap.lapNumber : ""),
     "- Average speed: " + reportFormatNumber(s.avgSpeedKph, 1, " kph"),
-    "- Main automatic focus: " + (report.precisionFindings[0]?.interpretation || "no strong weakness detected"),
+    "- Top speed: " + reportFormatNumber(s.topSpeedKph, 0, " kph"),
     "",
-    "## 5. Lap Comparison",
+    "## How The AI Coach Should Use This",
     "",
-    "| Lap | Time | Gap To Best | Avg Speed | Top Speed | Full Throttle | Heavy Brake | Coasting | Pedal Overlap |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "- Prioritize high severity coach signals.",
+    "- Give tips backed by telemetry evidence from this file.",
+    "- Focus on braking release, coasting, throttle confidence, pedal overlap, and steering smoothness.",
+    "- Keep advice practical: one or two things to try in the next session.",
+    "",
+    "## Lap Summary",
+    "",
+    "| Lap | Lap time | Avg speed | Top speed | Full throttle | Heavy brake | Coasting | Pedal overlap | Brake zones | Corner zones |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
   ];
 
-  for (const row of report.lapComparisonTable) {
+  for (const lap of report.lapSummaries) {
     lines.push(
       "| " +
         [
-          row.lapNumber,
-          row.lapTime || "-",
-          row.gapToBestMs === null ? "-" : reportFormatNumber(row.gapToBestMs / 1000, 3, " sec"),
-          reportFormatNumber(row.avgSpeedKph, 1, " kph"),
-          reportFormatNumber(row.maxSpeedKph, 0, " kph"),
-          reportFormatPct(row.fullThrottlePct),
-          reportFormatPct(row.heavyBrakePct),
-          reportFormatPct(row.coastingPct),
-          reportFormatPct(row.throttleBrakeOverlapPct),
+          lap.lapNumber,
+          lap.lapTime || "-",
+          reportFormatNumber(lap.avgSpeedKph, 1, " kph"),
+          reportFormatNumber(lap.maxSpeedKph, 0, " kph"),
+          reportFormatPct(lap.fullThrottlePct),
+          reportFormatPct(lap.heavyBrakePct),
+          reportFormatPct(lap.coastingPct),
+          reportFormatPct(lap.throttleBrakeOverlapPct),
+          lap.brakingZoneCount ?? 0,
+          lap.corneringZoneCount ?? 0,
         ].join(" | ") +
         " |"
     );
   }
 
-  lines.push("", "## 6. Top Coach Signals", "");
+  lines.push("", "## Coach Signals", "");
 
-  if (!report.topCoachSignals.length) {
+  if (!report.coachSignals.length) {
     lines.push("No major automatic warning signals were detected. Focus on lap-to-lap consistency and racing line.");
   } else {
-    report.topCoachSignals.forEach((signal, index) => {
+    report.coachSignals.forEach((signal, index) => {
       lines.push(
         "### Signal " + (index + 1) + ": " + signal.area,
         "",
@@ -2533,52 +2092,7 @@ function renderPostSessionMarkdown(report) {
     });
   }
 
-  lines.push(
-    "## 7. Precision Braking Findings",
-    "",
-    "| Lap | Zone | Location | Severity | Evidence | Coaching Tip |",
-    "| --- | --- | --- | --- | --- | --- |"
-  );
-
-  for (const finding of report.precisionFindings.filter((item) => item.type === "braking").slice(0, 8)) {
-    lines.push(
-      "| " +
-        [
-          finding.lapNumber,
-          finding.zoneId,
-          finding.location,
-          finding.severity,
-          finding.evidence,
-          finding.coachingTip,
-        ].join(" | ") +
-        " |"
-    );
-  }
-
-  lines.push(
-    "",
-    "## 8. Precision Corner Findings",
-    "",
-    "| Lap | Zone | Location | Severity | Evidence | Coaching Tip |",
-    "| --- | --- | --- | --- | --- | --- |"
-  );
-
-  for (const finding of report.precisionFindings.filter((item) => item.type === "cornering").slice(0, 8)) {
-    lines.push(
-      "| " +
-        [
-          finding.lapNumber,
-          finding.zoneId,
-          finding.location,
-          finding.severity,
-          finding.evidence,
-          finding.coachingTip,
-        ].join(" | ") +
-        " |"
-    );
-  }
-
-  lines.push("", "## 9. Lap Details", "");
+  lines.push("## Lap Details", "");
 
   for (const lap of report.lapSummaries) {
     lines.push(
@@ -2588,48 +2102,33 @@ function renderPostSessionMarkdown(report) {
       "- Sector 1: " + reportFormatMs(lap.sector1Ms),
       "- Sector 2: " + reportFormatMs(lap.sector2Ms),
       "- Sector 3: " + reportFormatMs(lap.sector3Ms),
+      "- Average throttle: " + reportFormatPct(lap.avgThrottlePct),
       "- Full throttle: " + reportFormatPct(lap.fullThrottlePct),
+      "- Average brake: " + reportFormatPct(lap.avgBrakePct),
       "- Heavy brake: " + reportFormatPct(lap.heavyBrakePct),
       "- Coasting: " + reportFormatPct(lap.coastingPct),
       "- Pedal overlap: " + reportFormatPct(lap.throttleBrakeOverlapPct),
-      "- Steering smoothness: " + reportFormatNumber(lap.steeringSmoothness, 4),
+      "- Average absolute steering: " + reportFormatNumber(lap.avgAbsSteering, 3),
+      "- Max absolute steering: " + reportFormatNumber(lap.maxAbsSteering, 3),
       ""
     );
 
     if (lap.brakingZones?.length) {
-      lines.push("Braking zones:");
-      for (const zone of lap.brakingZones.slice(0, 6)) {
+      lines.push("Key braking zones:");
+      for (const zone of lap.brakingZones.slice(0, 4)) {
         lines.push(
-          "- " + zone.zoneId +
-            " " + reportFormatNumber(zone.startLapDistanceM, 1, " m") +
-            "-" + reportFormatNumber(zone.endLapDistanceM, 1, " m") +
-            ": entry " + reportFormatNumber(zone.entrySpeedKph, 0, " kph") +
-            ", min " + reportFormatNumber(zone.minSpeedKph, 0, " kph") +
-            ", exit " + reportFormatNumber(zone.exitSpeedKph, 0, " kph") +
-            ", peak brake " + reportFormatPct(zone.peakBrakePct) +
-            ", trail brake " + reportFormatPct(zone.trailBrakePctOfZone) +
-            ", coast after brake " + reportFormatNumber(zone.coastingAfterBrakeSec, 2, " sec") +
-            (zone.comparisonToBestLap?.deltaExitSpeedKph != null ? ", exit vs best " + reportFormatNumber(zone.comparisonToBestLap.deltaExitSpeedKph, 1, " kph") : "") +
-            (zone.issueTags?.length ? ", flags: " + zone.issueTags.join(", ") : "")
-        );
-      }
-      lines.push("");
-    }
-
-    if (lap.corneringZones?.length) {
-      lines.push("Cornering zones:");
-      for (const zone of lap.corneringZones.slice(0, 6)) {
-        lines.push(
-          "- " + zone.zoneId +
-            " " + reportFormatNumber(zone.startLapDistanceM, 1, " m") +
-            "-" + reportFormatNumber(zone.endLapDistanceM, 1, " m") +
-            ": apex " + reportFormatNumber(zone.apexSpeedKph, 0, " kph") +
-            ", exit " + reportFormatNumber(zone.exitSpeedKph, 0, " kph") +
-            ", throttle at apex " + reportFormatPct(zone.throttleAtApexPct) +
-            ", coasting " + reportFormatPct(zone.coastingPct) +
-            ", peak steering " + reportFormatNumber(zone.peakAbsSteering, 3) +
-            (zone.comparisonToBestLap?.deltaExitSpeedKph != null ? ", exit vs best " + reportFormatNumber(zone.comparisonToBestLap.deltaExitSpeedKph, 1, " kph") : "") +
-            (zone.issueTags?.length ? ", flags: " + zone.issueTags.join(", ") : "")
+          "- " +
+            reportFormatNumber(zone.startLapDistanceM, 1, " m") +
+            " to " +
+            reportFormatNumber(zone.endLapDistanceM, 1, " m") +
+            ": entry " +
+            reportFormatNumber(zone.entrySpeedKph, 0, " kph") +
+            ", min " +
+            reportFormatNumber(zone.minSpeedKph, 0, " kph") +
+            ", exit " +
+            reportFormatNumber(zone.exitSpeedKph, 0, " kph") +
+            ", peak brake " +
+            reportFormatPct(zone.peakBrakePct)
         );
       }
       lines.push("");
@@ -2637,13 +2136,13 @@ function renderPostSessionMarkdown(report) {
   }
 
   lines.push(
-    "## 10. Requested AI Output",
+    "## Recommended AI Output Format",
     "",
     "1. Session overview in 3 short bullets.",
-    "2. Top 3 coaching tips, each with braking/corner evidence.",
-    "3. One lap-specific note comparing a weak lap to the best lap.",
-    "4. One braking drill and one corner-exit drill for the next session.",
-    "5. Confidence score based on data quality.",
+    "2. Top 3 improvements, each with telemetry evidence.",
+    "3. One lap-specific coaching note.",
+    "4. One drill for the next session.",
+    "5. Confidence score based on data completeness.",
     ""
   );
 
@@ -2673,7 +2172,7 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
   }
 
   const lapNumbers = [...new Set([...samplesByLap.keys(), ...lapByNumber.keys()])].sort((a, b) => a - b);
-  let lapSummaries = lapNumbers.map((lapNumber) =>
+  const lapSummaries = lapNumbers.map((lapNumber) =>
     summarizeReportLap(
       lapNumber,
       samplesByLap.get(lapNumber) || [],
@@ -2687,25 +2186,12 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
   const bestLap = validTimedLaps.length
     ? validTimedLaps.reduce((best, lap) => (lap.lapTimeMs < best.lapTimeMs ? lap : best), validTimedLaps[0])
     : null;
-  const worstLap = validTimedLaps.length
-    ? validTimedLaps.reduce((worst, lap) => (lap.lapTimeMs > worst.lapTimeMs ? lap : worst), validTimedLaps[0])
-    : null;
-
-  if (bestLap) {
-    lapSummaries = addZoneComparisons(lapSummaries, bestLap.lapNumber);
-  }
-
-  const dataQuality = buildDataQuality(samples, lapDocs, cornerDocs);
-  const precisionFindings = buildPrecisionFindings(lapSummaries, bestLap);
-  const topCoachSignals = buildPostSessionCoachSignals(lapSummaries, precisionFindings, bestLap);
-  const lapComparisonTable = buildLapComparisonTable(lapSummaries, bestLap);
   const status = samples.length || lapDocs.length ? "ready" : "empty";
 
   const report = stripUndefinedDeep({
     schema: POST_SESSION_REPORT_SCHEMA,
     status,
     generatedAtIso: new Date().toISOString(),
-    dataQuality,
     sessionSnapshot: {
       sessionId,
       userId: safeString(sessionData.userId, null),
@@ -2715,150 +2201,25 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
       sessionType: parseInteger(sessionData.sessionType, null),
       startedAt: reportIso(sessionData.startedAt),
       endedAt: reportIso(sessionData.endedAt) || new Date().toISOString(),
-      sampleCount: samples.rawSampleCount ?? samples.length,
-      analysedSampleCount: samples.length,
+      sampleCount: samples.length,
       lapCount: lapNumbers.length,
       cornerCount: cornerDocs.length,
       avgSpeedKph: reportRound(reportAvg(speeds), 1),
       topSpeedKph: speeds.length ? reportRound(Math.max(...speeds), 1) : null,
+      bestLap: bestLap
+        ? {
+            lapNumber: bestLap.lapNumber,
+            lapTimeMs: bestLap.lapTimeMs,
+            lapTime: bestLap.lapTime,
+          }
+        : null,
     },
-    bestLap: bestLap
-      ? {
-          lapNumber: bestLap.lapNumber,
-          lapTimeMs: bestLap.lapTimeMs,
-          lapTime: bestLap.lapTime,
-        }
-      : null,
-    worstLap: worstLap
-      ? {
-          lapNumber: worstLap.lapNumber,
-          lapTimeMs: worstLap.lapTimeMs,
-          lapTime: worstLap.lapTime,
-          gapToBestMs: bestLap ? worstLap.lapTimeMs - bestLap.lapTimeMs : null,
-        }
-      : null,
-    lapComparisonTable,
     lapSummaries,
-    precisionFindings,
-    topCoachSignals,
+    coachSignals: buildPostSessionCoachSignals(lapSummaries),
   });
 
-  report.aiReadableMarkdown = limitReportText(
-    renderPostSessionMarkdown({
-      ...report,
-      lapSummaries: report.lapSummaries.slice(0, MAX_MARKDOWN_LAPS),
-      lapComparisonTable: report.lapComparisonTable.slice(0, MAX_MARKDOWN_LAPS),
-      precisionFindings: report.precisionFindings.slice(0, MAX_REPORT_FINDINGS),
-      topCoachSignals: report.topCoachSignals.slice(0, MAX_REPORT_SIGNALS),
-    })
-  );
+  report.aiReadableMarkdown = renderPostSessionMarkdown(report);
   return report;
-}
-
-function limitReportText(text, maxChars = MAX_AI_MARKDOWN_CHARS) {
-  const value = String(text || "");
-  if (value.length <= maxChars) return value;
-  return (
-    value.slice(0, maxChars) +
-    "\n\n[Report truncated for storage safety. Full structured lap detail is stored in the reports/postSession/laps subcollection.]"
-  );
-}
-
-function compactReportZone(zone) {
-  return stripUndefinedDeep({
-    zoneId: zone.zoneId,
-    startLapDistanceM: zone.startLapDistanceM,
-    endLapDistanceM: zone.endLapDistanceM,
-    entrySpeedKph: zone.entrySpeedKph,
-    minSpeedKph: zone.minSpeedKph,
-    apexSpeedKph: zone.apexSpeedKph,
-    exitSpeedKph: zone.exitSpeedKph,
-    peakBrakePct: zone.peakBrakePct,
-    coastingAfterBrakeSec: zone.coastingAfterBrakeSec,
-    coastingPct: zone.coastingPct,
-    throttlePickupDelaySec: zone.throttlePickupDelaySec,
-    issueTags: Array.isArray(zone.issueTags) ? zone.issueTags.slice(0, 4) : [],
-    comparisonToBestLap: zone.comparisonToBestLap || null,
-  });
-}
-
-function compactLapForMainReport(lap) {
-  const importantBrakingZones = (lap.brakingZones || [])
-    .filter((zone) => (zone.issueTags || []).length || zone.comparisonToBestLap)
-    .slice(0, 3)
-    .map(compactReportZone);
-
-  const importantCorneringZones = (lap.corneringZones || [])
-    .filter((zone) => (zone.issueTags || []).length || zone.comparisonToBestLap)
-    .slice(0, 3)
-    .map(compactReportZone);
-
-  return stripUndefinedDeep({
-    lapNumber: lap.lapNumber,
-    sampleCount: lap.sampleCount,
-    lapTimeMs: lap.lapTimeMs,
-    lapTime: lap.lapTime,
-    sector1Ms: lap.sector1Ms,
-    sector2Ms: lap.sector2Ms,
-    sector3Ms: lap.sector3Ms,
-    valid: lap.valid,
-    avgSpeedKph: lap.avgSpeedKph,
-    maxSpeedKph: lap.maxSpeedKph,
-    fullThrottlePct: lap.fullThrottlePct,
-    heavyBrakePct: lap.heavyBrakePct,
-    coastingPct: lap.coastingPct,
-    throttleBrakeOverlapPct: lap.throttleBrakeOverlapPct,
-    avgAbsSteering: lap.avgAbsSteering,
-    steeringSmoothness: lap.steeringSmoothness,
-    brakingZoneCount: lap.brakingZoneCount,
-    corneringZoneCount: lap.corneringZoneCount,
-    importantBrakingZones,
-    importantCorneringZones,
-  });
-}
-
-function buildCompactPostSessionReport(report) {
-  return stripUndefinedDeep({
-    ...report,
-    lapSummaries: (report.lapSummaries || []).map(compactLapForMainReport),
-    precisionFindings: (report.precisionFindings || []).slice(0, MAX_REPORT_FINDINGS),
-    topCoachSignals: (report.topCoachSignals || []).slice(0, MAX_REPORT_SIGNALS),
-    aiReadableMarkdown: limitReportText(report.aiReadableMarkdown),
-    storageNote:
-      "Main report is compact to avoid Render/Firestore memory limits. Detailed braking and cornering evidence is stored in reports/postSession/laps.",
-  });
-}
-
-async function commitReportLapDetails(reportRef, lapSummaries, schema, sessionId) {
-  let batch = db.batch();
-  let writes = 0;
-  let totalWrites = 0;
-
-  for (const lap of (lapSummaries || []).slice(0, MAX_REPORT_LAP_DETAIL_DOCS)) {
-    const lapRef = reportRef.collection("laps").doc("lap_" + lap.lapNumber);
-
-    batch.set(lapRef, {
-      ...stripUndefinedDeep(lap),
-      schema,
-      sessionId,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-
-    writes += 1;
-    totalWrites += 1;
-
-    if (writes >= 400) {
-      await batch.commit();
-      batch = db.batch();
-      writes = 0;
-    }
-  }
-
-  if (writes > 0) {
-    await batch.commit();
-  }
-
-  return totalWrites;
 }
 
 async function buildAndSavePostSessionReport(sessionRef) {
@@ -2875,25 +2236,15 @@ async function buildAndSavePostSessionReport(sessionRef) {
   const cornerDocs = await collectSessionCornerDocs(sessionRef);
   const report = buildPostSessionReportDocument(sessionRef.id, sessionData, samples, lapDocs, cornerDocs);
   const reportPath = "sessions/" + sessionRef.id + "/reports/postSession";
-  const reportRef = sessionRef.collection("reports").doc("postSession");
 
-  const mainReport = buildCompactPostSessionReport(report);
-
-  await reportRef.set(
+  await sessionRef.collection("reports").doc("postSession").set(
     stripUndefinedDeep({
-      ...mainReport,
+      ...report,
       reportPath,
       generatedAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     }),
     { merge: false }
-  );
-
-  const lapDetailDocCount = await commitReportLapDetails(
-    reportRef,
-    report.lapSummaries || [],
-    report.schema,
-    sessionRef.id
   );
 
   await sessionRef.set(
@@ -2903,16 +2254,10 @@ async function buildAndSavePostSessionReport(sessionRef) {
       postSessionReportUpdatedAt: FieldValue.serverTimestamp(),
       postSessionReportSummary: {
         schema: report.schema,
-        dataConfidence: report.dataQuality.confidence,
         sampleCount: report.sessionSnapshot.sampleCount,
         lapCount: report.sessionSnapshot.lapCount,
-        coachSignalCount: report.topCoachSignals.length,
-        precisionFindingCount: report.precisionFindings.length,
-        lapDetailDocCount,
-        brakingFindingCount: report.precisionFindings.filter((finding) => finding.type === "braking").length,
-        cornerFindingCount: report.precisionFindings.filter((finding) => finding.type === "cornering").length,
-        bestLap: report.bestLap,
-        worstLap: report.worstLap,
+        coachSignalCount: report.coachSignals.length,
+        bestLap: report.sessionSnapshot.bestLap,
       },
     }),
     { merge: true }
@@ -2921,16 +2266,10 @@ async function buildAndSavePostSessionReport(sessionRef) {
   return {
     status: report.status,
     reportPath,
-    dataConfidence: report.dataQuality.confidence,
     sampleCount: report.sessionSnapshot.sampleCount,
     lapCount: report.sessionSnapshot.lapCount,
-    coachSignalCount: report.topCoachSignals.length,
-    precisionFindingCount: report.precisionFindings.length,
-    lapDetailDocCount,
-    brakingFindingCount: report.precisionFindings.filter((finding) => finding.type === "braking").length,
-    cornerFindingCount: report.precisionFindings.filter((finding) => finding.type === "cornering").length,
-    bestLap: report.bestLap,
-    worstLap: report.worstLap,
+    coachSignalCount: report.coachSignals.length,
+    bestLap: report.sessionSnapshot.bestLap,
   };
 }
 // POST_SESSION_AI_REPORT_END
@@ -3555,7 +2894,6 @@ app.get("/schema", (req, res) => {
       "sessions/{sessionId}/laps",
       "sessions/{sessionId}/corners",
       "sessions/{sessionId}/reports/postSession",
-      "sessions/{sessionId}/reports/postSession/laps/{lapId}",
       "trackMaps",
       "trackMaps/{trackKey}/centerlineChunks",
     ],
@@ -3564,7 +2902,7 @@ app.get("/schema", (req, res) => {
       latestMapPosition: "Small map-ready current car position.",
       mapSummary: "Session-level world bounds and map sample count.",
       trackMap: "Finalized map generated from a calibration/session recording.",
-      postSessionReport: "Coach Evidence Report stored at sessions/{sessionId}/reports/postSession, with detailed braking/cornering lap docs under reports/postSession/laps.",
+      postSessionReport: "Compact AI-readable post-session report stored at sessions/{sessionId}/reports/postSession.",
     },
     importantTrackMapFields: {
       worldBounds: "min/max world X/Z and calculated width/height in game metres.",
