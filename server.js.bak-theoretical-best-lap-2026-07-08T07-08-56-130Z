@@ -1815,7 +1815,7 @@ app.patch("/sessions/:id", async (req, res) => {
 });
 
 // POST_SESSION_AI_REPORT_START
-const POST_SESSION_REPORT_SCHEMA = "f1-coach-evidence-report-v3";
+const POST_SESSION_REPORT_SCHEMA = "f1-coach-evidence-report-v2";
 const LOW_MEMORY_REPORT_PATCH_APPLIED = true;
 const REPORT_TELEMETRY_CHUNK_PAGE_SIZE = Number(process.env.POST_SESSION_CHUNK_PAGE_SIZE || 2);
 const MAX_REPORT_SAMPLES_PER_LAP = Number(process.env.POST_SESSION_MAX_SAMPLES_PER_LAP || 120);
@@ -2495,93 +2495,13 @@ function buildDataQuality(samples, laps, corners) {
   };
 }
 
-function buildTheoreticalBestLap(lapDocs, bestLap = null) {
-  const sectorDefs = [
-    { sector: 1, key: "sector1Ms", label: "Sector 1" },
-    { sector: 2, key: "sector2Ms", label: "Sector 2" },
-    { sector: 3, key: "sector3Ms", label: "Sector 3" },
-  ];
-
-  const validRows = (lapDocs || [])
-    .map((lap) => ({
-      lapNumber: parseInteger(lap.lapNumber, null),
-      valid: lap.valid !== false,
-      sector1Ms: parseInteger(lap.sector1Ms, null),
-      sector2Ms: parseInteger(lap.sector2Ms, null),
-      sector3Ms: parseInteger(lap.sector3Ms, null),
-      lapTimeMs: parseInteger(lap.lapTimeMs, null),
-    }))
-    .filter((lap) => lap.valid && lap.lapNumber !== null);
-
-  const sectors = sectorDefs.map((def) => {
-    const candidates = validRows
-      .map((lap) => ({
-        sector: def.sector,
-        label: def.label,
-        lapNumber: lap.lapNumber,
-        sectorTimeMs: parseInteger(lap[def.key], null),
-      }))
-      .filter((row) => row.sectorTimeMs !== null && row.sectorTimeMs > 0);
-
-    if (!candidates.length) {
-      return {
-        sector: def.sector,
-        label: def.label,
-        lapNumber: null,
-        sectorTimeMs: null,
-        sectorTime: null,
-      };
-    }
-
-    const best = candidates.reduce(
-      (currentBest, row) =>
-        row.sectorTimeMs < currentBest.sectorTimeMs ? row : currentBest,
-      candidates[0]
-    );
-
-    return {
-      ...best,
-      sectorTime: reportFormatMs(best.sectorTimeMs),
-    };
-  });
-
-  const isComplete = sectors.every((sector) => sector.sectorTimeMs !== null);
-  const lapTimeMs = isComplete
-    ? sectors.reduce((sum, sector) => sum + sector.sectorTimeMs, 0)
-    : null;
-  const bestActualLapTimeMs = parseInteger(bestLap?.lapTimeMs, null);
-
-  return stripUndefinedDeep({
-    method:
-      "Best valid Sector 1 + best valid Sector 2 + best valid Sector 3. This is not a real driven lap; it is the combined sector pace ceiling from this session.",
-    isComplete,
-    validSectorLapCount: validRows.length,
-    missingSectors: sectors
-      .filter((sector) => sector.sectorTimeMs === null)
-      .map((sector) => sector.label),
-    lapTimeMs,
-    lapTime: reportFormatMs(lapTimeMs),
-    bestActualLapNumber: bestLap?.lapNumber ?? null,
-    bestActualLapTimeMs,
-    bestActualGapToTheoreticalMs:
-      lapTimeMs !== null && bestActualLapTimeMs !== null
-        ? bestActualLapTimeMs - lapTimeMs
-        : null,
-    sectors,
-  });
-}
-
-function buildLapComparisonTable(lapSummaries, bestLap, theoreticalBestLap = null) {
+function buildLapComparisonTable(lapSummaries, bestLap) {
   return lapSummaries.map((lap) => ({
     lapNumber: lap.lapNumber,
     valid: lap.valid !== false,
     lapTimeMs: lap.lapTimeMs,
     lapTime: lap.lapTime,
     gapToBestMs: bestLap && lap.lapTimeMs !== null ? lap.lapTimeMs - bestLap.lapTimeMs : null,
-    gapToTheoreticalBestMs:
-      theoreticalBestLap?.lapTimeMs !== null && lap.lapTimeMs !== null
-        ? lap.lapTimeMs - theoreticalBestLap.lapTimeMs
-        : null,
     avgSpeedKph: lap.avgSpeedKph,
     maxSpeedKph: lap.maxSpeedKph,
     fullThrottlePct: lap.fullThrottlePct,
@@ -2763,7 +2683,6 @@ function renderPostSessionMarkdown(report) {
     "- Use only this report as evidence.",
     "- Separate facts from guesses.",
     "- Prefer advice backed by braking-zone or corner-zone evidence.",
-    "- Use theoretical best lap as the sector-combination pace ceiling, but do not treat it as a real driven lap.",
     "- If data quality is limited, lower confidence instead of overclaiming.",
     "",
     "## 2. Data Quality",
@@ -2790,10 +2709,7 @@ function renderPostSessionMarkdown(report) {
     "",
     "## 4. Session Summary",
     "",
-    "- Best actual lap: " + (report.bestLap?.lapTime || "-") + (report.bestLap ? " on lap " + report.bestLap.lapNumber : ""),
-    "- Theoretical best lap: " + (report.theoreticalBestLap?.lapTime || "-") + (report.theoreticalBestLap?.isComplete ? " (best valid sectors combined)" : " (sector data incomplete)"),
-    "- Best actual gap to theoretical: " + (report.theoreticalBestLap?.bestActualGapToTheoreticalMs != null ? reportFormatNumber(report.theoreticalBestLap.bestActualGapToTheoreticalMs / 1000, 3, " sec") : "-"),
-    "- Theoretical sector sources: " + (report.theoreticalBestLap?.sectors?.length ? report.theoreticalBestLap.sectors.map((sector) => sector.sectorTime ? sector.label + " " + sector.sectorTime + " from lap " + sector.lapNumber : sector.label + " unavailable").join("; ") : "-"),
+    "- Best lap: " + (report.bestLap?.lapTime || "-") + (report.bestLap ? " on lap " + report.bestLap.lapNumber : ""),
     "- Worst valid lap: " + (report.worstLap?.lapTime || "-") + (report.worstLap ? " on lap " + report.worstLap.lapNumber : ""),
     "- Top speed: " + reportFormatNumber(s.topSpeedKph, 0, " kph"),
     "- Average speed: " + reportFormatNumber(s.avgSpeedKph, 1, " kph"),
@@ -2801,8 +2717,8 @@ function renderPostSessionMarkdown(report) {
     "",
     "## 5. Lap Comparison",
     "",
-    "| Lap | Time | Gap To Best Actual | Gap To Theoretical | Avg Speed | Top Speed | Full Throttle | Heavy Brake | Coasting | Pedal Overlap |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| Lap | Time | Gap To Best | Avg Speed | Top Speed | Full Throttle | Heavy Brake | Coasting | Pedal Overlap |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
   ];
 
   for (const row of report.lapComparisonTable) {
@@ -2812,7 +2728,6 @@ function renderPostSessionMarkdown(report) {
           row.lapNumber,
           row.lapTime || "-",
           row.gapToBestMs === null ? "-" : reportFormatNumber(row.gapToBestMs / 1000, 3, " sec"),
-          row.gapToTheoreticalBestMs === null ? "-" : reportFormatNumber(row.gapToTheoreticalBestMs / 1000, 3, " sec"),
           reportFormatNumber(row.avgSpeedKph, 1, " kph"),
           reportFormatNumber(row.maxSpeedKph, 0, " kph"),
           reportFormatPct(row.fullThrottlePct),
@@ -2950,7 +2865,7 @@ function renderPostSessionMarkdown(report) {
     "",
     "1. Session overview in 3 short bullets.",
     "2. Top 3 coaching tips, each with braking/corner evidence.",
-    "3. One lap-specific note comparing a weak lap to the best actual lap and theoretical best lap.",
+    "3. One lap-specific note comparing a weak lap to the best lap.",
     "4. One braking drill and one corner-exit drill for the next session.",
     "5. Confidence score based on data quality.",
     ""
@@ -3007,11 +2922,10 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
     lapSummaries = addZoneComparisons(lapSummaries, bestLap.lapNumber);
   }
 
-  const theoreticalBestLap = buildTheoreticalBestLap(lapDocs, bestLap);
   const dataQuality = buildDataQuality(samples, lapDocs, cornerDocs);
   const precisionFindings = buildPrecisionFindings(lapSummaries, bestLap);
   const topCoachSignals = buildPostSessionCoachSignals(lapSummaries, precisionFindings, bestLap);
-  const lapComparisonTable = buildLapComparisonTable(lapSummaries, bestLap, theoreticalBestLap);
+  const lapComparisonTable = buildLapComparisonTable(lapSummaries, bestLap);
   const status = samples.length || lapDocs.length ? "ready" : "empty";
 
   const report = stripUndefinedDeep({
@@ -3056,7 +2970,6 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
           gapToBestMs: bestLap ? worstLap.lapTimeMs - bestLap.lapTimeMs : null,
         }
       : null,
-    theoreticalBestLap,
     lapComparisonTable,
     lapSummaries,
     precisionFindings,
@@ -3249,7 +3162,6 @@ async function buildAndSavePostSessionReport(sessionRef, options = {}) {
         brakingFindingCount: report.precisionFindings.filter((finding) => finding.type === "braking").length,
         cornerFindingCount: report.precisionFindings.filter((finding) => finding.type === "cornering").length,
         bestLap: report.bestLap,
-        theoreticalBestLap: report.theoreticalBestLap,
         worstLap: report.worstLap,
       },
     }),
@@ -3271,7 +3183,6 @@ async function buildAndSavePostSessionReport(sessionRef, options = {}) {
     brakingFindingCount: report.precisionFindings.filter((finding) => finding.type === "braking").length,
     cornerFindingCount: report.precisionFindings.filter((finding) => finding.type === "cornering").length,
     bestLap: report.bestLap,
-    theoreticalBestLap: report.theoreticalBestLap,
     worstLap: report.worstLap,
   };
 }
