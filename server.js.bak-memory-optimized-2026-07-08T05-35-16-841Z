@@ -32,7 +32,7 @@ const db = getFirestore();
 
 app.use(helmet());
 app.use(cors());
-app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(morgan("dev"));
 
 function parseNumber(value, fallback = null) {
@@ -319,7 +319,7 @@ function buildMapStats(samples) {
     maxSpeed,
     longestBrakingZoneMeters,
     currentLapNumber,
-    mapPointCount: points.rawPointCount ?? points.length,
+    mapPointCount: points.length,
     bounds: boundsFromPoints(points),
     latestMapPosition: points.length ? buildLatestMapPosition(points[points.length - 1]) : null,
     mapPreviewPoints: downsamplePoints(points, 150).map(pointToSmallMapPoint),
@@ -1049,53 +1049,21 @@ function sortMapPoints(points) {
   });
 }
 
-async function collectSessionMapPoints(sessionRef, options = {}) {
-  let points = [];
-  let rawPointCount = 0;
-  let lastDoc = null;
-  const maxPoints = Math.max(100, parseInteger(options.maxPoints, MAX_SESSION_MAP_POINTS) || MAX_SESSION_MAP_POINTS);
+async function collectSessionMapPoints(sessionRef) {
+  const chunksSnap = await sessionRef.collection("telemetryChunks").get();
+  const points = [];
 
-  while (true) {
-    let queryRef = sessionRef
-      .collection("telemetryChunks")
-      .orderBy(FieldPath.documentId())
-      .limit(MAP_POINT_CHUNK_PAGE_SIZE);
+  for (const doc of chunksSnap.docs) {
+    const data = doc.data() || {};
+    const samples = Array.isArray(data.samples) ? data.samples : [];
 
-    if (lastDoc) {
-      queryRef = queryRef.startAfter(lastDoc);
+    for (const sample of samples) {
+      const point = extractMapPoint(sample);
+      if (point) points.push(point);
     }
-
-    const chunksSnap = await queryRef.get();
-    if (chunksSnap.empty) break;
-
-    for (const doc of chunksSnap.docs) {
-      const data = doc.data() || {};
-      const samples = Array.isArray(data.samples) ? data.samples : [];
-
-      for (const sample of samples) {
-        const point = extractMapPoint(sample);
-        if (!point) continue;
-
-        rawPointCount += 1;
-        points.push(point);
-
-        if (points.length > Math.ceil(maxPoints * 1.25)) {
-          points = downsamplePoints(points, maxPoints);
-        }
-      }
-    }
-
-    lastDoc = chunksSnap.docs[chunksSnap.docs.length - 1];
-    if (chunksSnap.size < MAP_POINT_CHUNK_PAGE_SIZE) break;
   }
 
-  const sorted = sortMapPoints(downsamplePoints(points, maxPoints));
-  Object.defineProperty(sorted, "rawPointCount", {
-    value: rawPointCount,
-    enumerable: false,
-  });
-
-  return sorted;
+  return sortMapPoints(points);
 }
 
 function buildLapTrailsFromMapPoints(points, maxPointsPerLap = 1200) {
@@ -1721,24 +1689,15 @@ app.patch("/sessions/:id", async (req, res) => {
 
 // POST_SESSION_AI_REPORT_START
 const POST_SESSION_REPORT_SCHEMA = "f1-coach-evidence-report-v2";
-const LOW_MEMORY_REPORT_PATCH_APPLIED = true;
-const REPORT_TELEMETRY_CHUNK_PAGE_SIZE = Number(process.env.POST_SESSION_CHUNK_PAGE_SIZE || 2);
-const MAX_REPORT_SAMPLES_PER_LAP = Number(process.env.POST_SESSION_MAX_SAMPLES_PER_LAP || 120);
-const MAX_REPORT_TOTAL_SAMPLES = Number(process.env.POST_SESSION_MAX_TOTAL_SAMPLES || 1200);
-const MAX_REPORT_LAP_DETAIL_DOCS = Number(process.env.POST_SESSION_MAX_LAP_DETAIL_DOCS || 20);
-const MAX_REPORT_FINDINGS = Number(process.env.POST_SESSION_MAX_FINDINGS || 8);
-const MAX_REPORT_SIGNALS = Number(process.env.POST_SESSION_MAX_SIGNALS || 6);
-const MAX_MARKDOWN_LAPS = Number(process.env.POST_SESSION_MAX_MARKDOWN_LAPS || 4);
-const MAX_AI_MARKDOWN_CHARS = Number(process.env.POST_SESSION_MAX_MARKDOWN_CHARS || 60000);
-const MAX_LIVE_REPORT_ANALYZED_LAPS = Number(process.env.POST_SESSION_LIVE_ANALYZED_LAPS || 4);
-const MAX_FINAL_REPORT_ANALYZED_LAPS = Number(process.env.POST_SESSION_FINAL_ANALYZED_LAPS || 10);
-const MAX_REPORT_LAP_SUMMARIES = Number(process.env.POST_SESSION_MAX_LAP_SUMMARIES || 40);
-const POST_SESSION_LIVE_REPORT_ENABLED = process.env.POST_SESSION_LIVE_REPORT_ENABLED !== "false";
-const POST_SESSION_FINAL_REPORT_ENABLED = process.env.POST_SESSION_FINAL_REPORT_ENABLED !== "false";
-const POST_SESSION_LIVE_REPORT_DEBOUNCE_MS = Number(process.env.POST_SESSION_LIVE_REPORT_DEBOUNCE_MS || 12000);
-const MAP_POINT_CHUNK_PAGE_SIZE = Number(process.env.MAP_POINT_CHUNK_PAGE_SIZE || 2);
-const MAX_SESSION_MAP_POINTS = Number(process.env.MAX_SESSION_MAP_POINTS || 5000);
-const MAX_LAP_TRAILS = Number(process.env.MAX_LAP_TRAILS || 12);
+const REPORT_TELEMETRY_CHUNK_PAGE_SIZE = Number(process.env.POST_SESSION_CHUNK_PAGE_SIZE || 20);
+const MAX_REPORT_SAMPLES_PER_LAP = Number(process.env.POST_SESSION_MAX_SAMPLES_PER_LAP || 450);
+const MAX_REPORT_TOTAL_SAMPLES = Number(process.env.POST_SESSION_MAX_TOTAL_SAMPLES || 6000);
+const MAX_REPORT_LAP_DETAIL_DOCS = Number(process.env.POST_SESSION_MAX_LAP_DETAIL_DOCS || 120);
+const MAX_REPORT_FINDINGS = Number(process.env.POST_SESSION_MAX_FINDINGS || 16);
+const MAX_REPORT_SIGNALS = Number(process.env.POST_SESSION_MAX_SIGNALS || 14);
+const MAX_MARKDOWN_LAPS = Number(process.env.POST_SESSION_MAX_MARKDOWN_LAPS || 12);
+const MAX_AI_MARKDOWN_CHARS = Number(process.env.POST_SESSION_MAX_MARKDOWN_CHARS || 180000);
+
 function reportRound(value, digits = 2) {
   if (value === null || value === undefined) return null;
   const n = Number(value);
@@ -1885,71 +1844,7 @@ function downsampleReportSamples(samples, maxSamples) {
   return out;
 }
 
-function uniqueSortedLapNumbers(values) {
-  return [...new Set((values || [])
-    .map((value) => parseInteger(value, null))
-    .filter((value) => value !== null && value > 0))]
-    .sort((a, b) => a - b);
-}
-
-function chooseReportLapNumbers(lapDocs, options = {}) {
-  const phase = safeString(options.phase, null) || "live";
-  const maxLaps =
-    phase === "live"
-      ? Math.max(1, MAX_LIVE_REPORT_ANALYZED_LAPS)
-      : Math.max(1, MAX_FINAL_REPORT_ANALYZED_LAPS);
-
-  const validTimed = (lapDocs || [])
-    .map((lap) => ({
-      lapNumber: parseInteger(lap.lapNumber, null),
-      lapTimeMs: parseInteger(lap.lapTimeMs, null),
-      valid: lap.valid !== false,
-    }))
-    .filter((lap) => lap.lapNumber !== null);
-
-  const timed = validTimed.filter((lap) => lap.valid && lap.lapTimeMs !== null);
-  const byLap = uniqueSortedLapNumbers(validTimed.map((lap) => lap.lapNumber));
-  const triggerLap = parseInteger(options.triggerLapNumber, null);
-  const chosen = [];
-
-  if (triggerLap !== null) {
-    chosen.push(triggerLap - 1, triggerLap);
-  }
-
-  if (timed.length) {
-    const best = timed.reduce((a, b) => (b.lapTimeMs < a.lapTimeMs ? b : a), timed[0]);
-    const worst = timed.reduce((a, b) => (b.lapTimeMs > a.lapTimeMs ? b : a), timed[0]);
-    chosen.push(best.lapNumber, worst.lapNumber);
-  }
-
-  const recent = byLap.slice(-maxLaps);
-  chosen.push(...recent);
-
-  return uniqueSortedLapNumbers(chosen).slice(-maxLaps);
-}
-
-function capReportLapNumbers(lapNumbers, options = {}) {
-  const triggerLap = parseInteger(options.triggerLapNumber, null);
-  if (!Array.isArray(lapNumbers) || lapNumbers.length <= MAX_REPORT_LAP_SUMMARIES) {
-    return lapNumbers;
-  }
-
-  const chosen = [];
-  if (triggerLap !== null) chosen.push(triggerLap - 1, triggerLap);
-  chosen.push(...lapNumbers.slice(-MAX_REPORT_LAP_SUMMARIES));
-  return uniqueSortedLapNumbers(chosen).slice(-MAX_REPORT_LAP_SUMMARIES);
-}
-
-async function collectSessionTelemetrySamples(sessionRef, options = {}) {
-  const targetLapNumbers = uniqueSortedLapNumbers(options.targetLapNumbers || []);
-  const targetLapSet = targetLapNumbers.length ? new Set(targetLapNumbers.map(String)) : null;
-  const maxSamplesPerLap =
-    Math.max(20, parseInteger(options.maxSamplesPerLap, MAX_REPORT_SAMPLES_PER_LAP) || MAX_REPORT_SAMPLES_PER_LAP);
-  const maxTotalSamples =
-    Math.max(100, parseInteger(options.maxTotalSamples, MAX_REPORT_TOTAL_SAMPLES) || MAX_REPORT_TOTAL_SAMPLES);
-  const maxAnalyzedLaps =
-    Math.max(1, parseInteger(options.maxAnalyzedLaps, targetLapNumbers.length || MAX_FINAL_REPORT_ANALYZED_LAPS) || MAX_FINAL_REPORT_ANALYZED_LAPS);
-
+async function collectSessionTelemetrySamples(sessionRef) {
   const samplesByLap = new Map();
   let fallbackIndex = 0;
   let rawSampleCount = 0;
@@ -1986,16 +1881,13 @@ async function collectSessionTelemetrySamples(sessionRef, options = {}) {
         if (!hasDrivingData) continue;
 
         const lapKey = normalized.lapNumber === null ? "unknown" : String(normalized.lapNumber);
-        if (targetLapSet && !targetLapSet.has(lapKey)) continue;
-        if (!targetLapSet && !samplesByLap.has(lapKey) && samplesByLap.size >= maxAnalyzedLaps) continue;
-
         if (!samplesByLap.has(lapKey)) samplesByLap.set(lapKey, []);
 
         const bucket = samplesByLap.get(lapKey);
         bucket.push(normalized);
 
-        if (bucket.length > Math.ceil(maxSamplesPerLap * 1.15)) {
-          samplesByLap.set(lapKey, downsampleReportSamples(bucket, maxSamplesPerLap));
+        if (bucket.length > Math.ceil(MAX_REPORT_SAMPLES_PER_LAP * 1.5)) {
+          samplesByLap.set(lapKey, downsampleReportSamples(bucket, MAX_REPORT_SAMPLES_PER_LAP));
         }
       }
     }
@@ -2006,10 +1898,11 @@ async function collectSessionTelemetrySamples(sessionRef, options = {}) {
 
   const samples = [];
   for (const bucket of samplesByLap.values()) {
-    samples.push(...downsampleReportSamples(bucket, maxSamplesPerLap));
+    samples.push(...downsampleReportSamples(bucket, MAX_REPORT_SAMPLES_PER_LAP));
   }
 
-  const capped = downsampleReportSamples(sortReportSamples(samples), maxTotalSamples);
+  const sorted = sortReportSamples(samples);
+  const capped = downsampleReportSamples(sorted, MAX_REPORT_TOTAL_SAMPLES);
 
   Object.defineProperty(capped, "rawSampleCount", {
     value: rawSampleCount,
@@ -2026,18 +1919,10 @@ async function collectSessionLapDocs(sessionRef) {
     .sort((a, b) => (parseInteger(a.lapNumber, 0) || 0) - (parseInteger(b.lapNumber, 0) || 0));
 }
 
-async function collectSessionCornerDocs(sessionRef, targetLapNumbers = null) {
-  const targetSet = targetLapNumbers?.length
-    ? new Set(uniqueSortedLapNumbers(targetLapNumbers).map(String))
-    : null;
+async function collectSessionCornerDocs(sessionRef) {
   const snap = await sessionRef.collection("corners").get();
   return snap.docs
     .map((docSnap) => serializeDoc(docSnap))
-    .filter((corner) => {
-      if (!targetSet) return true;
-      const lapNumber = parseInteger(corner.startLapNumber ?? corner.endLapNumber, null);
-      return lapNumber !== null && targetSet.has(String(lapNumber));
-    })
     .sort((a, b) => {
       const aLap = parseInteger(a.startLapNumber ?? a.endLapNumber, 0) || 0;
       const bLap = parseInteger(b.startLapNumber ?? b.endLapNumber, 0) || 0;
@@ -2803,7 +2688,7 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
     cornersByLap.get(lapNumber).push(corner);
   }
 
-  const lapNumbers = capReportLapNumbers([...new Set([...samplesByLap.keys(), ...lapByNumber.keys()])].sort((a, b) => a - b), options);
+  const lapNumbers = [...new Set([...samplesByLap.keys(), ...lapByNumber.keys()])].sort((a, b) => a - b);
   let lapSummaries = lapNumbers.map((lapNumber) =>
     summarizeReportLap(
       lapNumber,
@@ -3007,16 +2892,9 @@ async function buildAndSavePostSessionReport(sessionRef, options = {}) {
   }
 
   const sessionData = serializeDoc(sessionSnap);
+  const samples = await collectSessionTelemetrySamples(sessionRef);
   const lapDocs = await collectSessionLapDocs(sessionRef);
-  const targetLapNumbers = chooseReportLapNumbers(lapDocs, options);
-  const phase = safeString(options.phase, null) || (isClosedSession(sessionData) ? "final" : "live");
-  const maxAnalyzedLaps = phase === "live" ? MAX_LIVE_REPORT_ANALYZED_LAPS : MAX_FINAL_REPORT_ANALYZED_LAPS;
-  const samples = await collectSessionTelemetrySamples(sessionRef, {
-    ...options,
-    targetLapNumbers,
-    maxAnalyzedLaps,
-  });
-  const cornerDocs = await collectSessionCornerDocs(sessionRef, targetLapNumbers);
+  const cornerDocs = await collectSessionCornerDocs(sessionRef);
   const report = buildPostSessionReportDocument(
     sessionRef.id,
     sessionData,
@@ -3106,7 +2984,6 @@ function mergeLiveReportOptions(previous = {}, next = {}) {
 
 async function runLivePostSessionReportQueue(sessionRef, state) {
   state.running = true;
-  state.timer = null;
   state.promise = (async () => {
     try {
       while (state.pending) {
@@ -3143,7 +3020,7 @@ async function runLivePostSessionReportQueue(sessionRef, state) {
       if (!state.pending) {
         livePostSessionReportJobs.delete(sessionRef.id);
       } else {
-        scheduleLivePostSessionReportBuild(sessionRef, state, POST_SESSION_LIVE_REPORT_DEBOUNCE_MS);
+        runLivePostSessionReportQueue(sessionRef, state);
       }
     }
   })();
@@ -3151,27 +3028,13 @@ async function runLivePostSessionReportQueue(sessionRef, state) {
   await state.promise;
 }
 
-function scheduleLivePostSessionReportBuild(sessionRef, state, delayMs) {
-  if (state.running) return;
-  if (state.timer) clearTimeout(state.timer);
-
-  state.timer = setTimeout(() => {
-    runLivePostSessionReportQueue(sessionRef, state).catch((err) => {
-      console.error("Live post-session report queue error:", err);
-    });
-  }, Math.max(0, delayMs));
-}
-
 function queueLivePostSessionReportBuild(sessionRef, options = {}) {
-  if (!POST_SESSION_LIVE_REPORT_ENABLED) return false;
-
   const sessionId = sessionRef.id;
   const state =
     livePostSessionReportJobs.get(sessionId) || {
       running: false,
       pending: null,
       promise: null,
-      timer: null,
     };
 
   state.pending = mergeLiveReportOptions(state.pending || {}, {
@@ -3181,8 +3044,14 @@ function queueLivePostSessionReportBuild(sessionRef, options = {}) {
   });
 
   livePostSessionReportJobs.set(sessionId, state);
-  scheduleLivePostSessionReportBuild(sessionRef, state, POST_SESSION_LIVE_REPORT_DEBOUNCE_MS);
-  return true;
+
+  if (!state.running) {
+    setImmediate(() => {
+      runLivePostSessionReportQueue(sessionRef, state).catch((err) => {
+        console.error("Live post-session report queue error:", err);
+      });
+    });
+  }
 }
 
 function getLivePostSessionReportPromise(sessionId) {
@@ -3261,28 +3130,10 @@ app.post("/sessions/:id/end", async (req, res) => {
     let postSessionReport = null;
 
     try {
-      if (!POST_SESSION_FINAL_REPORT_ENABLED) {
-        postSessionReport = {
-          status: "skipped",
-          reportPhase: "final",
-          reportTrigger: "session_end",
-          reason: "final post-session reports disabled",
-        };
-        await sessionRef.set(
-          {
-            postSessionReportStatus: "skipped",
-            postSessionReportPhase: "final",
-            postSessionReportTrigger: "session_end",
-            postSessionReportUpdatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-      } else {
-        postSessionReport = await buildAndSavePostSessionReport(sessionRef, {
-          phase: "final",
-          trigger: "session_end",
-        });
-      }
+      postSessionReport = await buildAndSavePostSessionReport(sessionRef, {
+        phase: "final",
+        trigger: "session_end",
+      });
     } catch (reportErr) {
       console.error("Post-session report generation error:", reportErr);
       postSessionReport = {
@@ -3426,9 +3277,8 @@ app.post("/sessions/:id/laps", async (req, res) => {
       parseBoolean(req.query.updateReport, true) !== false &&
       parseBoolean(req.body.updateReport, true) !== false;
 
-    let reportQueued = false;
     if (shouldUpdateReport) {
-      reportQueued = queueLivePostSessionReportBuild(sessionRef, {
+      queueLivePostSessionReportBuild(sessionRef, {
         triggerLapNumber: lapNumber,
       });
     }
@@ -3436,7 +3286,7 @@ app.post("/sessions/:id/laps", async (req, res) => {
     res.status(201).json({
       success: true,
       lapNumber,
-      postSessionReport: reportQueued
+      postSessionReport: shouldUpdateReport
         ? {
             status: "queued",
             reportPhase: "live",
@@ -3444,13 +3294,7 @@ app.post("/sessions/:id/laps", async (req, res) => {
             triggerLapNumber: lapNumber,
             reportPath: "sessions/" + sessionId + "/reports/postSession",
           }
-        : {
-            status: "skipped",
-            reportPhase: "live",
-            reportTrigger: "lap",
-            triggerLapNumber: lapNumber,
-            reason: shouldUpdateReport ? "live reports disabled" : "updateReport disabled",
-          },
+        : null,
     });
   } catch (err) {
     console.error("POST /sessions/:id/laps error:", err);
@@ -3487,8 +3331,7 @@ app.get("/sessions/:id/laps", async (req, res) => {
 app.get("/sessions/:id/lap-trails", async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
-    const requestedMaxPointsPerLap = parseInteger(req.query.maxPointsPerLap, 400) || 400;
-    const maxPointsPerLap = Math.max(50, Math.min(requestedMaxPointsPerLap, 600));
+    const maxPointsPerLap = parseInteger(req.query.maxPointsPerLap, 1200) || 1200;
     const sessionRef = db.collection("sessions").doc(sessionId);
     const sessionSnap = await sessionRef.get();
 
@@ -3496,16 +3339,14 @@ app.get("/sessions/:id/lap-trails", async (req, res) => {
       return res.status(404).json({ error: "session not found" });
     }
 
-    const points = await collectSessionMapPoints(sessionRef, {
-      maxPoints: Math.max(500, maxPointsPerLap * MAX_LAP_TRAILS),
-    });
+    const points = await collectSessionMapPoints(sessionRef);
     const lapTrails = buildLapTrailsFromMapPoints(points, maxPointsPerLap);
 
     res.json({
       sessionId,
       lapTrails,
       lapCount: lapTrails.length,
-      sourcePointCount: points.rawPointCount ?? points.length,
+      sourcePointCount: points.length,
     });
   } catch (err) {
     console.error("GET /sessions/:id/lap-trails error:", err);
@@ -3714,8 +3555,7 @@ app.post("/telemetry/batch", async (req, res) => {
 app.post("/sessions/:id/track-map/finalize", authenticate, requireAdmin, async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
-    const requestedMaxPoints = parseInteger(req.body.maxPoints, 500) || 500;
-    const maxPoints = Math.max(100, Math.min(requestedMaxPoints, 800));
+    const maxPoints = parseInteger(req.body.maxPoints, 800) || 800;
 
     const sessionRef = db.collection("sessions").doc(sessionId);
     const sessionSnap = await sessionRef.get();
@@ -3724,9 +3564,7 @@ app.post("/sessions/:id/track-map/finalize", authenticate, requireAdmin, async (
     }
 
     const sessionData = sessionSnap.data() || {};
-    const points = await collectSessionMapPoints(sessionRef, {
-      maxPoints: Math.max(maxPoints * 3, 1000),
-    });
+    const points = await collectSessionMapPoints(sessionRef);
 
     if (points.length === 0) {
       return res.status(400).json({
@@ -3748,7 +3586,7 @@ app.post("/sessions/:id/track-map/finalize", authenticate, requireAdmin, async (
       trackName,
       sourceSessionId: sessionId,
       worldBounds: bounds,
-      sourceSampleCount: points.rawPointCount ?? points.length,
+      sourceSampleCount: points.length,
       centerlinePointCount: centerline.length,
       centerlineVersion: version,
       finalizedAt: FieldValue.serverTimestamp(),
@@ -3758,7 +3596,7 @@ app.post("/sessions/:id/track-map/finalize", authenticate, requireAdmin, async (
       {
         trackMap,
         mapSummary: mergeMapSummary(sessionData.mapSummary || {}, {
-          mapPointCount: points.rawPointCount ?? points.length,
+          mapPointCount: points.length,
           bounds,
         }, buildLatestMapPosition(points[points.length - 1]), sessionData),
       },
@@ -3776,7 +3614,7 @@ app.post("/sessions/:id/track-map/finalize", authenticate, requireAdmin, async (
         trackName,
         worldBounds: mergeBounds(existingTrack.worldBounds, bounds),
         sourceSessionId: sessionId,
-        sourceSampleCount: points.rawPointCount ?? points.length,
+        sourceSampleCount: points.length,
         centerlinePointCount: centerline.length,
         centerlineVersion: version,
         updatedAt: FieldValue.serverTimestamp(),
@@ -3793,7 +3631,7 @@ app.post("/sessions/:id/track-map/finalize", authenticate, requireAdmin, async (
       sessionId,
       trackKey,
       worldBounds: bounds,
-      sourceSampleCount: points.rawPointCount ?? points.length,
+      sourceSampleCount: points.length,
       centerlinePointCount: centerline.length,
       centerlineChunkCount: chunkCount,
       centerlineVersion: version,
