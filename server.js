@@ -2132,7 +2132,7 @@ app.patch("/sessions/:id", async (req, res) => {
 });
 
 // POST_SESSION_AI_REPORT_START
-const POST_SESSION_REPORT_SCHEMA = "f1-coach-evidence-report-v3";
+const POST_SESSION_REPORT_SCHEMA = "f1-coach-evidence-report-v4";
 const LOW_MEMORY_REPORT_PATCH_APPLIED = true;
 const REPORT_TELEMETRY_CHUNK_PAGE_SIZE = Number(process.env.POST_SESSION_CHUNK_PAGE_SIZE || 2);
 const MAX_REPORT_SAMPLES_PER_LAP = Number(process.env.POST_SESSION_MAX_SAMPLES_PER_LAP || 120);
@@ -2152,6 +2152,14 @@ const LAP_TRAIL_SPEED_PATCH_APPLIED = true;
 const MAP_POINT_CHUNK_PAGE_SIZE = Number(process.env.MAP_POINT_CHUNK_PAGE_SIZE || 25);
 const MAX_SESSION_MAP_POINTS = Number(process.env.MAX_SESSION_MAP_POINTS || 5000);
 const MAX_LAP_TRAILS = Number(process.env.MAX_LAP_TRAILS || 12);
+const APEX_CORNER_DISTANCE_STEP_M = Number(process.env.POST_SESSION_CORNER_STEP_M || 2);
+const APEX_CORNER_MIN_GAP_M = Number(process.env.POST_SESSION_CORNER_MIN_GAP_M || 80);
+const APEX_CORNER_PROMINENCE_KPH = Number(process.env.POST_SESSION_CORNER_PROMINENCE_KPH || 8);
+const APEX_CORNER_WINDOW_BEFORE_M = Number(process.env.POST_SESSION_CORNER_WINDOW_BEFORE_M || 120);
+const APEX_CORNER_WINDOW_AFTER_M = Number(process.env.POST_SESSION_CORNER_WINDOW_AFTER_M || 40);
+const APEX_CORNER_EXIT_WINDOW_M = Number(process.env.POST_SESSION_CORNER_EXIT_WINDOW_M || 150);
+const APEX_CORNER_BRAKE_THRESHOLD = Number(process.env.POST_SESSION_CORNER_BRAKE_THRESHOLD || 0.1);
+const APEX_CORNER_FULL_THROTTLE = Number(process.env.POST_SESSION_CORNER_FULL_THROTTLE || 0.95);
 function reportRound(value, digits = 2) {
   if (value === null || value === undefined) return null;
   const n = Number(value);
@@ -2729,6 +2737,496 @@ function addZoneComparisons(lapSummaries, bestLapNumber) {
   return lapSummaries;
 }
 
+
+function reportControlFraction(value) {
+  const n = finiteNumberOrNull(value);
+  if (n === null) return null;
+  const fraction = n > 1.5 ? n / 100 : n;
+  return Math.max(0, Math.min(1, fraction));
+}
+
+function prepareApexDistanceTrace(samples) {
+  const points = sortReportSamples(samples)
+    .map((sample) => ({
+      distance: finiteNumberOrNull(sample.lapDistance),
+      speedKph: finiteNumberOrNull(sample.speedKph),
+      brake: reportControlFraction(sample.brake),
+      throttle: reportControlFraction(sample.throttle),
+      sampleIndex: parseInteger(sample.sampleIndex, null),
+    }))
+    .filter((point) => point.distance !== null && point.distance >= 0 && point.speedKph !== null)
+    .sort((a, b) => {
+      if (a.distance !== b.distance) return a.distance - b.distance;
+      return (a.sampleIndex ?? 0) - (b.sampleIndex ?? 0);
+    });
+
+  const deduped = [];
+  for (const point of points) {
+    const previous = deduped[deduped.length - 1];
+    if (previous && Math.abs(previous.distance - point.distance) < 0.001) {
+      deduped[deduped.length - 1] = point;
+    } else if (!previous || point.distance > previous.distance) {
+      deduped.push(point);
+    }
+  }
+
+  return deduped;
+}
+
+function interpolateApexSeries(points, key, grid, fallback = null) {
+  const series = points
+    .map((point) => ({
+      distance: point.distance,
+      value: finiteNumberOrNull(point[key]),
+    }))
+    .filter((point) => point.value !== null);
+
+  if (!series.length) return grid.map(() => fallback);
+  if (series.length === 1) return grid.map(() => series[0].value);
+
+  const out = [];
+  let cursor = 0;
+
+  for (const distance of grid) {
+    while (cursor < series.length - 2 && series[cursor + 1].distance < distance) {
+      cursor += 1;
+    }
+
+    const left = series[cursor];
+    const right = series[cursor + 1] || left;
+
+    if (distance <= series[0].distance) {
+      out.push(series[0].value);
+    } else if (distance >= series[series.length - 1].distance) {
+      out.push(series[series.length - 1].value);
+    } else if (!right || right.distance === left.distance) {
+      out.push(left.value);
+    } else {
+      const t = (distance - left.distance) / (right.distance - left.distance);
+      out.push(left.value + (right.value - left.value) * t);
+    }
+  }
+
+  return out;
+}
+
+function resampleReportLapByDistance(samples, stepM = APEX_CORNER_DISTANCE_STEP_M) {
+  const points = prepareApexDistanceTrace(samples);
+  if (points.length < 8) return null;
+
+  const startDistance = points[0].distance;
+  const endDistance = points[points.length - 1].distance;
+  if (!Number.isFinite(startDistance) || !Number.isFinite(endDistance) || endDistance - startDistance < 80) {
+    return null;
+  }
+
+  const step = Math.max(1, Number(stepM) || APEX_CORNER_DISTANCE_STEP_M);
+  const gridStart = Math.ceil(startDistance / step) * step;
+  const gridEnd = Math.floor(endDistance / step) * step;
+  const distance = [];
+
+  for (let d = gridStart; d <= gridEnd; d += step) {
+    distance.push(reportRound(d, 3));
+  }
+
+  if (distance.length < 8) return null;
+
+  return {
+    distance,
+    speed: interpolateApexSeries(points, "speedKph", distance, null),
+    brake: interpolateApexSeries(points, "brake", distance, 0),
+    throttle: interpolateApexSeries(points, "throttle", distance, 0),
+    sourceSampleCount: points.length,
+    distanceStartM: reportRound(startDistance, 1),
+    distanceEndM: reportRound(endDistance, 1),
+    distanceStepM: step,
+  };
+}
+
+function findApexCornerApexes(resampled, minGapM = APEX_CORNER_MIN_GAP_M, prominenceKph = APEX_CORNER_PROMINENCE_KPH) {
+  if (!resampled?.distance?.length || !resampled?.speed?.length) return [];
+
+  const apexes = [];
+  const speed = resampled.speed;
+  const distance = resampled.distance;
+
+  for (let i = 2; i < speed.length - 2; i += 1) {
+    const current = finiteNumberOrNull(speed[i]);
+    if (current === null) continue;
+
+    let localMinimum = true;
+    for (let offset = -2; offset <= 2; offset += 1) {
+      const neighbor = finiteNumberOrNull(speed[i + offset]);
+      if (neighbor !== null && current > neighbor) {
+        localMinimum = false;
+        break;
+      }
+    }
+    if (!localMinimum) continue;
+
+    const before = speed
+      .slice(Math.max(0, i - 15), i)
+      .map((value) => finiteNumberOrNull(value))
+      .filter((value) => value !== null);
+    const after = speed
+      .slice(i + 1, Math.min(speed.length, i + 16))
+      .map((value) => finiteNumberOrNull(value))
+      .filter((value) => value !== null);
+    if (!before.length || !after.length) continue;
+
+    const localMaxBefore = Math.max(...before);
+    const localMaxAfter = Math.max(...after);
+    if (Math.min(localMaxBefore, localMaxAfter) - current >= prominenceKph) {
+      apexes.push({
+        apexDistanceM: finiteNumberOrNull(distance[i]),
+        referenceApexSpeedKph: current,
+      });
+    }
+  }
+
+  const merged = [];
+  for (const apex of apexes) {
+    const previous = merged[merged.length - 1];
+    if (previous && apex.apexDistanceM - previous.apexDistanceM < minGapM) {
+      if (apex.referenceApexSpeedKph < previous.referenceApexSpeedKph) {
+        merged[merged.length - 1] = apex;
+      }
+    } else {
+      merged.push(apex);
+    }
+  }
+
+  return merged;
+}
+
+function extractApexExitSpeed(resampled, apexDistanceM, nextApexDistanceM = null) {
+  const searchLimit = Math.min(
+    apexDistanceM + APEX_CORNER_EXIT_WINDOW_M,
+    nextApexDistanceM !== null ? nextApexDistanceM - 20 : apexDistanceM + APEX_CORNER_EXIT_WINDOW_M
+  );
+  const indexes = [];
+
+  for (let i = 0; i < resampled.distance.length; i += 1) {
+    const d = resampled.distance[i];
+    if (d >= apexDistanceM && d <= searchLimit) indexes.push(i);
+  }
+
+  if (!indexes.length) return null;
+
+  const fullThrottleIndex = indexes.find((index) => (resampled.throttle[index] ?? 0) >= APEX_CORNER_FULL_THROTTLE);
+  const index = fullThrottleIndex ?? indexes[indexes.length - 1];
+  const method = fullThrottleIndex === undefined ? "window_edge_fallback" : "full_throttle_point";
+
+  return stripUndefinedDeep({
+    exitSpeedKph: reportRound(resampled.speed[index], 1),
+    exitDistanceFromApexM: reportRound(resampled.distance[index] - apexDistanceM, 1),
+    exitLapDistanceM: reportRound(resampled.distance[index], 1),
+    method,
+  });
+}
+
+function analyzeApexCorner(resampled, referenceCorner, nextReferenceCorner = null) {
+  const apexDistanceM = finiteNumberOrNull(referenceCorner?.apexDistanceM);
+  if (apexDistanceM === null) return null;
+
+  const windowStart = apexDistanceM - APEX_CORNER_WINDOW_BEFORE_M;
+  const windowEnd = apexDistanceM + APEX_CORNER_WINDOW_AFTER_M;
+  const indexes = [];
+
+  for (let i = 0; i < resampled.distance.length; i += 1) {
+    const d = resampled.distance[i];
+    if (d >= windowStart && d <= windowEnd) indexes.push(i);
+  }
+
+  if (!indexes.length) return null;
+
+  let minIndex = indexes[0];
+  for (const index of indexes) {
+    if ((resampled.speed[index] ?? Infinity) < (resampled.speed[minIndex] ?? Infinity)) {
+      minIndex = index;
+    }
+  }
+
+  const brakeIndex = indexes.find(
+    (index) => resampled.distance[index] <= apexDistanceM && (resampled.brake[index] ?? 0) >= APEX_CORNER_BRAKE_THRESHOLD
+  );
+  const brakePointDistance = brakeIndex === undefined ? null : resampled.distance[brakeIndex];
+  const nextApexDistanceM = finiteNumberOrNull(nextReferenceCorner?.apexDistanceM);
+  const exit = extractApexExitSpeed(resampled, apexDistanceM, nextApexDistanceM);
+
+  return stripUndefinedDeep({
+    apexDistanceM: reportRound(apexDistanceM, 1),
+    analysisWindowStartM: reportRound(windowStart, 1),
+    analysisWindowEndM: reportRound(windowEnd, 1),
+    minCornerSpeedKph: reportRound(resampled.speed[minIndex], 1),
+    minSpeedLapDistanceM: reportRound(resampled.distance[minIndex], 1),
+    brakePointLapDistanceM: reportRound(brakePointDistance, 1),
+    brakeDistanceBeforeApexM:
+      brakePointDistance !== null ? reportRound(apexDistanceM - brakePointDistance, 1) : null,
+    exitSpeedKph: exit?.exitSpeedKph ?? null,
+    exitDistanceFromApexM: exit?.exitDistanceFromApexM ?? null,
+    exitLapDistanceM: exit?.exitLapDistanceM ?? null,
+    exitMeasurementMethod: exit?.method ?? null,
+  });
+}
+
+function compareApexCorner(userCorner, referenceCorner, cornerIndex, referenceLapNumber) {
+  const cornerId = "AC-" + String(cornerIndex).padStart(2, "0");
+  if (!userCorner || !referenceCorner) {
+    return {
+      cornerId,
+      cornerIndex,
+      status: "missing",
+      referenceLapNumber,
+      apexDistanceM: referenceCorner?.apexDistanceM ?? null,
+    };
+  }
+
+  const minSpeedDeltaKph = reportRound(userCorner.minCornerSpeedKph - referenceCorner.minCornerSpeedKph, 1);
+  const brakeDistanceDeltaM =
+    userCorner.brakeDistanceBeforeApexM !== null && referenceCorner.brakeDistanceBeforeApexM !== null
+      ? reportRound(userCorner.brakeDistanceBeforeApexM - referenceCorner.brakeDistanceBeforeApexM, 1)
+      : null;
+  const exitSpeedDeltaKph =
+    userCorner.exitSpeedKph !== null && referenceCorner.exitSpeedKph !== null
+      ? reportRound(userCorner.exitSpeedKph - referenceCorner.exitSpeedKph, 1)
+      : null;
+  const exitDistanceDeltaM =
+    userCorner.exitDistanceFromApexM !== null && referenceCorner.exitDistanceFromApexM !== null
+      ? reportRound(userCorner.exitDistanceFromApexM - referenceCorner.exitDistanceFromApexM, 1)
+      : null;
+  const exitMeasurementConfidence =
+    userCorner.exitMeasurementMethod === "full_throttle_point" &&
+    referenceCorner.exitMeasurementMethod === "full_throttle_point"
+      ? "high"
+      : "low";
+  const issueTags = [];
+
+  if (minSpeedDeltaKph <= -5) issueTags.push("lower minimum corner speed than reference");
+  if (brakeDistanceDeltaM !== null && brakeDistanceDeltaM >= 10) issueTags.push("braking earlier than reference");
+  if (brakeDistanceDeltaM !== null && brakeDistanceDeltaM <= -10) issueTags.push("braking later than reference");
+  if (exitSpeedDeltaKph !== null && exitSpeedDeltaKph <= -5 && exitMeasurementConfidence === "high") {
+    issueTags.push("lower exit speed than reference");
+  }
+  if (exitDistanceDeltaM !== null && exitDistanceDeltaM >= 12 && exitMeasurementConfidence === "high") {
+    issueTags.push("reaches full throttle later than reference");
+  }
+  if (exitMeasurementConfidence === "low") issueTags.push("exit speed confidence low");
+
+  return stripUndefinedDeep({
+    cornerId,
+    cornerIndex,
+    status: "ready",
+    referenceLapNumber,
+    apexDistanceM: userCorner.apexDistanceM,
+    analysisWindowStartM: userCorner.analysisWindowStartM,
+    analysisWindowEndM: userCorner.analysisWindowEndM,
+    minCornerSpeedKph: userCorner.minCornerSpeedKph,
+    brakePointLapDistanceM: userCorner.brakePointLapDistanceM,
+    brakeDistanceBeforeApexM: userCorner.brakeDistanceBeforeApexM,
+    exitSpeedKph: userCorner.exitSpeedKph,
+    exitDistanceFromApexM: userCorner.exitDistanceFromApexM,
+    exitMeasurementMethod: userCorner.exitMeasurementMethod,
+    reference: {
+      minCornerSpeedKph: referenceCorner.minCornerSpeedKph,
+      brakeDistanceBeforeApexM: referenceCorner.brakeDistanceBeforeApexM,
+      exitSpeedKph: referenceCorner.exitSpeedKph,
+      exitDistanceFromApexM: referenceCorner.exitDistanceFromApexM,
+      exitMeasurementMethod: referenceCorner.exitMeasurementMethod,
+    },
+    deltas: {
+      minSpeedDeltaKph,
+      brakeDistanceDeltaM,
+      exitSpeedDeltaKph,
+      exitDistanceDeltaM,
+    },
+    exitMeasurementConfidence,
+    issueTags,
+  });
+}
+
+function summarizeApexCornerComparisons(corners) {
+  const ready = (corners || []).filter((corner) => corner.status === "ready");
+  const highConfidenceExit = ready.filter((corner) => corner.exitMeasurementConfidence === "high");
+
+  return stripUndefinedDeep({
+    cornerCount: ready.length,
+    highConfidenceExitCount: highConfidenceExit.length,
+    lowConfidenceExitCount: ready.length - highConfidenceExit.length,
+    avgMinSpeedDeltaKph: reportRound(reportAvg(ready.map((corner) => corner.deltas?.minSpeedDeltaKph)), 1),
+    avgBrakeDistanceDeltaM: reportRound(reportAvg(ready.map((corner) => corner.deltas?.brakeDistanceDeltaM)), 1),
+    avgExitSpeedDeltaKph: reportRound(reportAvg(highConfidenceExit.map((corner) => corner.deltas?.exitSpeedDeltaKph)), 1),
+    avgExitDistanceDeltaM: reportRound(reportAvg(highConfidenceExit.map((corner) => corner.deltas?.exitDistanceDeltaM)), 1),
+    weakestCorners: [...ready]
+      .sort((a, b) => scoreApexCornerComparison(b) - scoreApexCornerComparison(a))
+      .slice(0, 3)
+      .map((corner) => stripUndefinedDeep({
+        cornerId: corner.cornerId,
+        apexDistanceM: corner.apexDistanceM,
+        issueTags: corner.issueTags,
+        deltas: corner.deltas,
+      })),
+  });
+}
+
+function buildApexCornerAnalysisForLaps(lapSummaries, samplesByLap, bestLap) {
+  if (!bestLap?.lapNumber) {
+    return {
+      lapSummaries,
+      reference: { status: "unavailable", reason: "no valid best lap" },
+      summary: { status: "unavailable", reason: "no valid best lap" },
+    };
+  }
+
+  const referenceSamples = samplesByLap.get(bestLap.lapNumber) || [];
+  const referenceResampled = resampleReportLapByDistance(referenceSamples);
+  if (!referenceResampled) {
+    return {
+      lapSummaries,
+      reference: { status: "unavailable", reason: "reference lap has insufficient lap-distance telemetry", referenceLapNumber: bestLap.lapNumber },
+      summary: { status: "unavailable", reason: "reference lap has insufficient lap-distance telemetry", referenceLapNumber: bestLap.lapNumber },
+    };
+  }
+
+  const apexes = findApexCornerApexes(referenceResampled);
+  if (!apexes.length) {
+    return {
+      lapSummaries,
+      reference: { status: "unavailable", reason: "no clear speed-minimum corner apexes found", referenceLapNumber: bestLap.lapNumber },
+      summary: { status: "unavailable", reason: "no clear speed-minimum corner apexes found", referenceLapNumber: bestLap.lapNumber },
+    };
+  }
+
+  const referenceCorners = apexes
+    .map((apex, index) => {
+      const analyzed = analyzeApexCorner(referenceResampled, apex, apexes[index + 1] || null);
+      if (!analyzed) return null;
+      return stripUndefinedDeep({
+        cornerId: "AC-" + String(index + 1).padStart(2, "0"),
+        cornerIndex: index + 1,
+        ...analyzed,
+      });
+    })
+    .filter(Boolean);
+
+  if (!referenceCorners.length) {
+    return {
+      lapSummaries,
+      reference: { status: "unavailable", reason: "corner apexes were found but could not be measured", referenceLapNumber: bestLap.lapNumber },
+      summary: { status: "unavailable", reason: "corner apexes were found but could not be measured", referenceLapNumber: bestLap.lapNumber },
+    };
+  }
+
+  const nextLapSummaries = lapSummaries.map((lap) => {
+    const lapSamples = samplesByLap.get(lap.lapNumber) || [];
+    const resampled = resampleReportLapByDistance(lapSamples);
+
+    if (!resampled) {
+      return {
+        ...lap,
+        apexCornerAnalysis: {
+          status: "unavailable",
+          reason: "insufficient lap-distance telemetry for this lap",
+          referenceLapNumber: bestLap.lapNumber,
+          referenceCornerCount: referenceCorners.length,
+        },
+      };
+    }
+
+    const corners = referenceCorners.map((referenceCorner, index) => {
+      const userCorner = analyzeApexCorner(resampled, referenceCorner, referenceCorners[index + 1] || null);
+      return compareApexCorner(userCorner, referenceCorner, index + 1, bestLap.lapNumber);
+    });
+
+    return stripUndefinedDeep({
+      ...lap,
+      apexCornerAnalysis: {
+        status: "ready",
+        schema: "distance-apex-corner-v1",
+        method:
+          "Corners are detected as speed minima on the best actual lap, then every lap is compared on a shared lap-distance grid.",
+        referenceLapNumber: bestLap.lapNumber,
+        referenceCornerCount: referenceCorners.length,
+        analysedCornerCount: corners.filter((corner) => corner.status === "ready").length,
+        distanceStepM: resampled.distanceStepM,
+        sourceSampleCount: resampled.sourceSampleCount,
+        summary: summarizeApexCornerComparisons(corners),
+        corners,
+      },
+    });
+  });
+
+  return {
+    lapSummaries: nextLapSummaries,
+    reference: {
+      status: "ready",
+      schema: "distance-apex-corner-reference-v1",
+      method: "Speed-minimum apexes detected from the best actual lap and reused for lap-to-lap comparison.",
+      referenceLapNumber: bestLap.lapNumber,
+      cornerCount: referenceCorners.length,
+      distanceStepM: referenceResampled.distanceStepM,
+      sourceSampleCount: referenceResampled.sourceSampleCount,
+      corners: referenceCorners,
+    },
+    summary: {
+      status: "ready",
+      referenceLapNumber: bestLap.lapNumber,
+      cornerCount: referenceCorners.length,
+      distanceStepM: referenceResampled.distanceStepM,
+      analysedLapCount: nextLapSummaries.filter((lap) => lap.apexCornerAnalysis?.status === "ready").length,
+    },
+  };
+}
+
+function scoreApexCornerComparison(corner) {
+  if (!corner || corner.status !== "ready") return 0;
+  const deltas = corner.deltas || {};
+  let score = 0;
+
+  if ((deltas.minSpeedDeltaKph ?? 0) <= -5) score += 3;
+  if ((deltas.minSpeedDeltaKph ?? 0) <= -10) score += 2;
+  if (deltas.brakeDistanceDeltaM != null && deltas.brakeDistanceDeltaM >= 10) score += 2;
+  if (deltas.brakeDistanceDeltaM != null && deltas.brakeDistanceDeltaM >= 20) score += 1;
+  if (corner.exitMeasurementConfidence === "high" && (deltas.exitSpeedDeltaKph ?? 0) <= -5) score += 3;
+  if (corner.exitMeasurementConfidence === "high" && (deltas.exitSpeedDeltaKph ?? 0) <= -10) score += 2;
+  if (corner.exitMeasurementConfidence === "high" && (deltas.exitDistanceDeltaM ?? 0) >= 12) score += 3;
+
+  return score;
+}
+
+function apexCornerEvidenceText(corner) {
+  const deltas = corner.deltas || {};
+  return (
+    "Apex " + reportFormatNumber(corner.apexDistanceM, 1, " m") +
+    ", min speed " + reportFormatNumber(corner.minCornerSpeedKph, 1, " kph") +
+    " (" + reportFormatNumber(deltas.minSpeedDeltaKph, 1, " kph vs ref") + ")" +
+    ", brake point " + reportFormatNumber(corner.brakeDistanceBeforeApexM, 1, " m before apex") +
+    (deltas.brakeDistanceDeltaM != null ? " (" + reportFormatNumber(deltas.brakeDistanceDeltaM, 1, " m vs ref") + ")" : "") +
+    ", exit " + reportFormatNumber(corner.exitSpeedKph, 1, " kph") +
+    (corner.exitMeasurementConfidence === "high" && deltas.exitSpeedDeltaKph != null
+      ? " (" + reportFormatNumber(deltas.exitSpeedDeltaKph, 1, " kph vs ref") + ")"
+      : " (exit confidence low)") +
+    ", full throttle distance " + reportFormatNumber(corner.exitDistanceFromApexM, 1, " m after apex")
+  );
+}
+
+function apexCornerCoachingTip(corner) {
+  const deltas = corner.deltas || {};
+  if (corner.exitMeasurementConfidence === "high" && (deltas.exitDistanceDeltaM ?? 0) >= 12) {
+    return "Focus on earlier throttle commitment after the apex. The reference reaches full throttle sooner, so check entry rotation and avoid waiting on exit.";
+  }
+  if (corner.exitMeasurementConfidence === "high" && (deltas.exitSpeedDeltaKph ?? 0) <= -5) {
+    return "Prioritize exit speed here. Try a cleaner brake release and earlier throttle pickup while keeping the car inside track limits.";
+  }
+  if ((deltas.brakeDistanceDeltaM ?? 0) >= 10 && (deltas.minSpeedDeltaKph ?? 0) <= -5) {
+    return "The driver is braking earlier and still carrying less minimum speed. Move the brake point later in small steps and release pressure more progressively.";
+  }
+  if ((deltas.minSpeedDeltaKph ?? 0) <= -5) {
+    return "Carry a little more minimum speed at the apex, but only if it does not delay throttle on exit.";
+  }
+  return "Use this corner as a reference check for brake point, apex speed, and throttle commitment.";
+}
+
 function summarizeReportLap(lapNumber, rawSamples, lapDoc, corners) {
   const samples = reportAttachLapIndexes(rawSamples);
   const speeds = samples.map((sample) => sample.speedKph).filter((value) => value !== null);
@@ -2910,6 +3408,10 @@ function buildLapComparisonTable(lapSummaries, bestLap, theoreticalBestLap = nul
     avgAbsSteering: lap.avgAbsSteering,
     brakingZoneCount: lap.brakingZoneCount,
     corneringZoneCount: lap.corneringZoneCount,
+    apexCornerCount: lap.apexCornerAnalysis?.summary?.cornerCount ?? null,
+    avgApexMinSpeedDeltaKph: lap.apexCornerAnalysis?.summary?.avgMinSpeedDeltaKph ?? null,
+    avgApexBrakeDistanceDeltaM: lap.apexCornerAnalysis?.summary?.avgBrakeDistanceDeltaM ?? null,
+    avgApexExitSpeedDeltaKph: lap.apexCornerAnalysis?.summary?.avgExitSpeedDeltaKph ?? null,
   }));
 }
 
@@ -2989,6 +3491,21 @@ function buildPrecisionFindings(lapSummaries, bestLap) {
             : (zone.peakAbsSteering ?? 0) >= 0.85
               ? "Smooth the steering trace and avoid adding extra lock while asking for throttle."
               : "Compare this corner to the best lap and aim to keep minimum speed and exit throttle closer to the reference.",
+      });
+    }
+    for (const corner of lap.apexCornerAnalysis?.corners || []) {
+      const score = scoreApexCornerComparison(corner);
+      if (!score && !(corner.issueTags || []).length) continue;
+      findings.push({
+        type: "cornering",
+        severity: score >= 7 ? "high" : score >= 4 ? "medium" : "low",
+        score,
+        lapNumber: lap.lapNumber,
+        zoneId: corner.cornerId,
+        location: "apex " + reportFormatNumber(corner.apexDistanceM, 1, " m"),
+        evidence: apexCornerEvidenceText(corner),
+        interpretation: (corner.issueTags || []).join(", ") || "distance-aligned corner metrics differ from reference lap",
+        coachingTip: apexCornerCoachingTip(corner),
       });
     }
   }
@@ -3081,7 +3598,9 @@ function renderPostSessionMarkdown(report) {
     "",
     "- Use only this report as evidence.",
     "- Separate facts from guesses.",
-    "- Prefer advice backed by braking-zone or corner-zone evidence.",
+    "- Prefer advice backed by braking-zone, corner-zone, or apex-corner comparison evidence.",
+    "- For apex-corner evidence, brakeDistanceDeltaM > 0 means the driver braked earlier than the reference; exitDistanceDeltaM > 0 means they reached full throttle later.",
+    "- Only make confident exit-speed claims when exitMeasurementConfidence is high.",
     "- Use theoretical best lap as the sector-combination pace ceiling, but do not treat it as a real driven lap.",
     "- If data quality is limited, lower confidence instead of overclaiming.",
     "",
@@ -3113,6 +3632,7 @@ function renderPostSessionMarkdown(report) {
     "- Theoretical best lap: " + (report.theoreticalBestLap?.lapTime || "-") + (report.theoreticalBestLap?.isComplete ? " (best valid sectors combined)" : " (sector data incomplete)"),
     "- Best actual gap to theoretical: " + (report.theoreticalBestLap?.bestActualGapToTheoreticalMs != null ? reportFormatNumber(report.theoreticalBestLap.bestActualGapToTheoreticalMs / 1000, 3, " sec") : "-"),
     "- Theoretical sector sources: " + (report.theoreticalBestLap?.sectors?.length ? report.theoreticalBestLap.sectors.map((sector) => sector.sectorTime ? sector.label + " " + sector.sectorTime + " from lap " + sector.lapNumber : sector.label + " unavailable").join("; ") : "-"),
+    "- Apex corner reference: " + (report.apexCornerAnalysisSummary?.status === "ready" ? String(report.apexCornerAnalysisSummary.cornerCount) + " corners from lap " + report.apexCornerAnalysisSummary.referenceLapNumber : (report.apexCornerAnalysisSummary?.reason || "unavailable")),
     "- Worst valid lap: " + (report.worstLap?.lapTime || "-") + (report.worstLap ? " on lap " + report.worstLap.lapNumber : ""),
     "- Top speed: " + reportFormatNumber(s.topSpeedKph, 0, " kph"),
     "- Average speed: " + reportFormatNumber(s.avgSpeedKph, 1, " kph"),
@@ -3262,6 +3782,25 @@ function renderPostSessionMarkdown(report) {
       }
       lines.push("");
     }
+    if (lap.apexCornerAnalysis?.status === "ready" && lap.apexCornerAnalysis.corners?.length) {
+      lines.push("Apex corner analysis:");
+      for (const corner of lap.apexCornerAnalysis.corners.slice(0, 8)) {
+        lines.push(
+          "- " + corner.cornerId +
+            " apex " + reportFormatNumber(corner.apexDistanceM, 1, " m") +
+            ": min " + reportFormatNumber(corner.minCornerSpeedKph, 1, " kph") +
+            " (" + reportFormatNumber(corner.deltas?.minSpeedDeltaKph, 1, " kph vs ref") + ")" +
+            ", brake " + reportFormatNumber(corner.brakeDistanceBeforeApexM, 1, " m before apex") +
+            (corner.deltas?.brakeDistanceDeltaM != null ? " (" + reportFormatNumber(corner.deltas.brakeDistanceDeltaM, 1, " m vs ref") + ")" : "") +
+            ", exit " + reportFormatNumber(corner.exitSpeedKph, 1, " kph") +
+            (corner.exitMeasurementConfidence === "high" && corner.deltas?.exitSpeedDeltaKph != null ? " (" + reportFormatNumber(corner.deltas.exitSpeedDeltaKph, 1, " kph vs ref") + ")" : " (exit confidence low)") +
+            ", full throttle " + reportFormatNumber(corner.exitDistanceFromApexM, 1, " m after apex") +
+            (corner.deltas?.exitDistanceDeltaM != null ? " (" + reportFormatNumber(corner.deltas.exitDistanceDeltaM, 1, " m vs ref") + ")" : "") +
+            (corner.issueTags?.length ? ", flags: " + corner.issueTags.join(", ") : "")
+        );
+      }
+      lines.push("");
+    }
   }
 
   lines.push(
@@ -3322,6 +3861,11 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
     ? validTimedLaps.reduce((worst, lap) => (lap.lapTimeMs > worst.lapTimeMs ? lap : worst), validTimedLaps[0])
     : null;
 
+  const apexCornerAnalysis = buildApexCornerAnalysisForLaps(lapSummaries, samplesByLap, bestLap);
+  lapSummaries = apexCornerAnalysis.lapSummaries;
+  const apexCornerAnalysisSummary = apexCornerAnalysis.summary;
+  const apexCornerReference = apexCornerAnalysis.reference;
+
   if (bestLap) {
     lapSummaries = addZoneComparisons(lapSummaries, bestLap.lapNumber);
   }
@@ -3376,6 +3920,8 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
         }
       : null,
     theoreticalBestLap,
+    apexCornerAnalysisSummary,
+    apexCornerReference,
     lapComparisonTable,
     lapSummaries,
     precisionFindings,
@@ -3432,6 +3978,21 @@ function compactLapForMainReport(lap) {
     .slice(0, 3)
     .map(compactReportZone);
 
+  const importantApexCorners = (lap.apexCornerAnalysis?.corners || [])
+    .filter((corner) => (corner.issueTags || []).length || scoreApexCornerComparison(corner) > 0)
+    .slice(0, 4)
+    .map((corner) => stripUndefinedDeep({
+      cornerId: corner.cornerId,
+      apexDistanceM: corner.apexDistanceM,
+      minCornerSpeedKph: corner.minCornerSpeedKph,
+      brakeDistanceBeforeApexM: corner.brakeDistanceBeforeApexM,
+      exitSpeedKph: corner.exitSpeedKph,
+      exitDistanceFromApexM: corner.exitDistanceFromApexM,
+      exitMeasurementConfidence: corner.exitMeasurementConfidence,
+      deltas: corner.deltas,
+      issueTags: corner.issueTags,
+    }));
+
   return stripUndefinedDeep({
     lapNumber: lap.lapNumber,
     sampleCount: lap.sampleCount,
@@ -3453,6 +4014,8 @@ function compactLapForMainReport(lap) {
     corneringZoneCount: lap.corneringZoneCount,
     importantBrakingZones,
     importantCorneringZones,
+    apexCornerSummary: lap.apexCornerAnalysis?.summary || null,
+    importantApexCorners,
   });
 }
 
@@ -3569,6 +4132,7 @@ async function buildAndSavePostSessionReport(sessionRef, options = {}) {
         cornerFindingCount: report.precisionFindings.filter((finding) => finding.type === "cornering").length,
         bestLap: report.bestLap,
         theoreticalBestLap: report.theoreticalBestLap,
+        apexCornerAnalysis: report.apexCornerAnalysisSummary,
         worstLap: report.worstLap,
       },
     }),
@@ -3591,6 +4155,7 @@ async function buildAndSavePostSessionReport(sessionRef, options = {}) {
     cornerFindingCount: report.precisionFindings.filter((finding) => finding.type === "cornering").length,
     bestLap: report.bestLap,
     theoreticalBestLap: report.theoreticalBestLap,
+    apexCornerAnalysis: report.apexCornerAnalysisSummary,
     worstLap: report.worstLap,
   };
 }
@@ -4255,7 +4820,7 @@ app.get("/sessions/:id/laps/:lapId/performance", optionalAuthenticate, async (re
     const trackKey =
       safeString(sessionData.trackKey, null) ||
       trackKeyFrom(sessionData.trackId, sessionData.trackName);
-    const [personalBest, samples, corners] = await Promise.all([
+    const [personalBest, samples, corners, reportLapSnap] = await Promise.all([
       lapPerfFindPersonalBest(sessionData.userId, trackKey),
       collectSessionTelemetrySamples(sessionRef, {
         targetLapNumbers: [lapNumber],
@@ -4265,7 +4830,15 @@ app.get("/sessions/:id/laps/:lapId/performance", optionalAuthenticate, async (re
         chunkPageSize: 20,
       }),
       collectSessionCornerDocs(sessionRef, [lapNumber]),
+      sessionRef
+        .collection("reports")
+        .doc("postSession")
+        .collection("laps")
+        .doc("lap_" + lapNumber)
+        .get()
+        .catch(() => null),
     ]);
+    const reportLapData = reportLapSnap?.exists ? serializeDoc(reportLapSnap) : null;
     const lapSamples = lapPerfSortSamples(
       samples.filter((sample) => parseInteger(sample.lapNumber, null) === lapNumber)
     );
@@ -4355,6 +4928,7 @@ app.get("/sessions/:id/laps/:lapId/performance", optionalAuthenticate, async (re
           activePct: lapSamples.length ? lapPerfRound((drsActiveCount / lapSamples.length) * 100, 1) : 0,
         },
       },
+      apexCornerAnalysis: reportLapData?.apexCornerAnalysis || null,
       traces,
       corners: corners.map((corner) => stripUndefinedDeep({
         id: corner.id,
