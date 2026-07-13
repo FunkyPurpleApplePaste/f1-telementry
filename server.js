@@ -765,6 +765,51 @@ async function authenticate(req, res, next) {
   }
 }
 
+async function optionalAuthenticate(req, res, next) {
+  try {
+    const token = getBearerToken(req);
+
+    if (!token) {
+      return next();
+    }
+
+    const sessionRef = db.collection("authSessions").doc(authTokenHash(token));
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return next();
+    }
+
+    const session = sessionSnap.data() || {};
+    const expiresAt = asDate(session.expiresAt);
+
+    if (!session.userId || !expiresAt || expiresAt <= new Date()) {
+      await sessionRef.delete().catch(() => {});
+      return next();
+    }
+
+    const userRef = db.collection("users").doc(session.userId);
+    const userSnap = await userRef.get();
+
+    if (!userSnap.exists) {
+      return next();
+    }
+
+    req.authSessionRef = sessionRef;
+    req.userRef = userRef;
+    req.user = toPublicUser({ id: userSnap.id, ...(userSnap.data() || {}) });
+
+    if (isSuspendedUser(req.user)) {
+      return res.status(403).json({ error: "account is suspended" });
+    }
+
+    return next();
+  } catch (err) {
+    console.error("Optional auth middleware error:", err);
+    return next();
+  }
+}
+
 function getListenerToken(req) {
   const headerToken = safeString(req.get("x-listener-token"), null);
   if (headerToken) return headerToken;
@@ -2317,6 +2362,8 @@ async function collectSessionTelemetrySamples(sessionRef, options = {}) {
     Math.max(100, parseInteger(options.maxTotalSamples, MAX_REPORT_TOTAL_SAMPLES) || MAX_REPORT_TOTAL_SAMPLES);
   const maxAnalyzedLaps =
     Math.max(1, parseInteger(options.maxAnalyzedLaps, targetLapNumbers.length || MAX_FINAL_REPORT_ANALYZED_LAPS) || MAX_FINAL_REPORT_ANALYZED_LAPS);
+  const requestedChunkPageSize = parseInteger(options.chunkPageSize, REPORT_TELEMETRY_CHUNK_PAGE_SIZE);
+  const chunkPageSize = Math.max(1, Math.min(requestedChunkPageSize || REPORT_TELEMETRY_CHUNK_PAGE_SIZE, 30));
 
   const samplesByLap = new Map();
   let fallbackIndex = 0;
@@ -2327,7 +2374,7 @@ async function collectSessionTelemetrySamples(sessionRef, options = {}) {
     let queryRef = sessionRef
       .collection("telemetryChunks")
       .orderBy(FieldPath.documentId())
-      .limit(REPORT_TELEMETRY_CHUNK_PAGE_SIZE);
+      .limit(chunkPageSize);
 
     if (lastDoc) {
       queryRef = queryRef.startAfter(lastDoc);
@@ -2369,7 +2416,7 @@ async function collectSessionTelemetrySamples(sessionRef, options = {}) {
     }
 
     lastDoc = chunksSnap.docs[chunksSnap.docs.length - 1];
-    if (chunksSnap.size < REPORT_TELEMETRY_CHUNK_PAGE_SIZE) break;
+    if (chunksSnap.size < chunkPageSize) break;
   }
 
   const samples = [];
@@ -4094,53 +4141,76 @@ function lapPerfBuildTraces(samples, maxSamples) {
   });
 }
 
+// LAP_PERFORMANCE_SPEED_PATCH
+const lapPerfPersonalBestCache = new Map();
+const LAP_PERF_PB_CACHE_MS = 5 * 60 * 1000;
+
 async function lapPerfFindPersonalBest(userId, trackKey) {
   if (!userId || !trackKey) return null;
+
+  const cacheKey = String(userId) + "|" + String(trackKey);
+  const cached = lapPerfPersonalBestCache.get(cacheKey);
+  if (cached && Date.now() - cached.savedAt < LAP_PERF_PB_CACHE_MS) {
+    return cached.value;
+  }
 
   const sessionsSnap = await db
     .collection("sessions")
     .where("userId", "==", userId)
     .limit(300)
     .get();
-  let best = null;
-
-  for (const sessionDoc of sessionsSnap.docs) {
+  const matchingSessions = sessionsSnap.docs.filter((sessionDoc) => {
     const sessionData = serializeDoc(sessionDoc);
     const candidateTrackKey =
       safeString(sessionData.trackKey, null) ||
       trackKeyFrom(sessionData.trackId, sessionData.trackName);
+    return candidateTrackKey === trackKey;
+  });
+  let best = null;
+  const concurrency = 12;
 
-    if (candidateTrackKey !== trackKey) continue;
+  for (let offset = 0; offset < matchingSessions.length; offset += concurrency) {
+    const sessionBatch = matchingSessions.slice(offset, offset + concurrency);
+    const lapSnapshots = await Promise.all(
+      sessionBatch.map((sessionDoc) => sessionDoc.ref.collection("laps").get())
+    );
 
-    const lapsSnap = await sessionDoc.ref.collection("laps").get();
+    for (let sessionIndex = 0; sessionIndex < sessionBatch.length; sessionIndex += 1) {
+      const sessionDoc = sessionBatch[sessionIndex];
+      const lapsSnap = lapSnapshots[sessionIndex];
 
-    for (const lapDoc of lapsSnap.docs) {
-      const lapData = serializeDoc(lapDoc);
-      if (!isRealValidLeaderboardLap(lapData)) continue;
+      for (const lapDoc of lapsSnap.docs) {
+        const lapData = serializeDoc(lapDoc);
+        if (!isRealValidLeaderboardLap(lapData)) continue;
 
-      const lapTimeMs = parseInteger(lapData.lapTimeMs, null);
-      if (lapTimeMs === null) continue;
+        const lapTimeMs = parseInteger(lapData.lapTimeMs, null);
+        if (lapTimeMs === null) continue;
 
-      if (!best || lapTimeMs < best.lapTimeMs) {
-        best = stripUndefinedDeep({
-          sessionId: sessionDoc.id,
-          lapId: lapDoc.id,
-          lapNumber: parseInteger(lapData.lapNumber, null),
-          lapTimeMs,
-          lapTime: formatLapTime(lapTimeMs),
-          sector1Ms: parseInteger(lapData.sector1Ms, null),
-          sector2Ms: parseInteger(lapData.sector2Ms, null),
-          sector3Ms: parseInteger(lapData.sector3Ms, null),
-          recordedAt: lapData.recordedAt || null,
-        });
+        if (!best || lapTimeMs < best.lapTimeMs) {
+          best = stripUndefinedDeep({
+            sessionId: sessionDoc.id,
+            lapId: lapDoc.id,
+            lapNumber: parseInteger(lapData.lapNumber, null),
+            lapTimeMs,
+            lapTime: formatLapTime(lapTimeMs),
+            sector1Ms: parseInteger(lapData.sector1Ms, null),
+            sector2Ms: parseInteger(lapData.sector2Ms, null),
+            sector3Ms: parseInteger(lapData.sector3Ms, null),
+            recordedAt: lapData.recordedAt || null,
+          });
+        }
       }
     }
   }
 
+  lapPerfPersonalBestCache.set(cacheKey, {
+    savedAt: Date.now(),
+    value: best,
+  });
   return best;
 }
 
-app.get("/sessions/:id/laps/:lapId/performance", authenticate, async (req, res) => {
+app.get("/sessions/:id/laps/:lapId/performance", optionalAuthenticate, async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
     const requestedLapId = safeString(req.params.lapId);
@@ -4156,8 +4226,6 @@ app.get("/sessions/:id/laps/:lapId/performance", authenticate, async (req, res) 
     if (!sessionSnap.exists) {
       return res.status(404).json({ error: "session not found" });
     }
-    if (!requireReadableSession(req, res, sessionSnap.data() || {})) return;
-
     let lapRef = sessionRef.collection("laps").doc(requestedLapId);
     let lapSnap = await lapRef.get();
     const requestedLapNumber = parseInteger(requestedLapId, null);
@@ -4173,6 +4241,11 @@ app.get("/sessions/:id/laps/:lapId/performance", authenticate, async (req, res) 
 
     const sessionData = serializeDoc(sessionSnap);
     const lapData = serializeDoc(lapSnap);
+
+    if (!canReadSession(req, sessionData) && !isRealValidLeaderboardLap(lapData)) {
+      return res.status(403).json({ error: "only valid leaderboard laps are public" });
+    }
+
     const lapNumber = parseInteger(lapData.lapNumber, null);
 
     if (lapNumber === null) {
@@ -4182,17 +4255,20 @@ app.get("/sessions/:id/laps/:lapId/performance", authenticate, async (req, res) 
     const trackKey =
       safeString(sessionData.trackKey, null) ||
       trackKeyFrom(sessionData.trackId, sessionData.trackName);
-    const personalBest = await lapPerfFindPersonalBest(sessionData.userId, trackKey);
-    const samples = await collectSessionTelemetrySamples(sessionRef, {
-      targetLapNumbers: [lapNumber],
-      maxSamplesPerLap: maxSamples,
-      maxTotalSamples: maxSamples,
-      maxAnalyzedLaps: 1,
-    });
+    const [personalBest, samples, corners] = await Promise.all([
+      lapPerfFindPersonalBest(sessionData.userId, trackKey),
+      collectSessionTelemetrySamples(sessionRef, {
+        targetLapNumbers: [lapNumber],
+        maxSamplesPerLap: maxSamples,
+        maxTotalSamples: maxSamples,
+        maxAnalyzedLaps: 1,
+        chunkPageSize: 20,
+      }),
+      collectSessionCornerDocs(sessionRef, [lapNumber]),
+    ]);
     const lapSamples = lapPerfSortSamples(
       samples.filter((sample) => parseInteger(sample.lapNumber, null) === lapNumber)
     );
-    const corners = await collectSessionCornerDocs(sessionRef, [lapNumber]);
     const traces = lapPerfBuildTraces(lapSamples, maxSamples);
     const lapTimeMs = parseInteger(lapData.lapTimeMs, null);
 
