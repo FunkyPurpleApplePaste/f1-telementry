@@ -2623,6 +2623,28 @@ function normalizeReportSample(raw, fallbackIndex) {
     corneringSpeed: finiteNumberOrNull(raw?.corneringSpeed),
     brakingDistance: finiteNumberOrNull(raw?.brakingDistance),
     drs: parseBoolean(raw?.drs, false),
+    drsAvailable: parseBoolean(
+      raw?.drsAvailable ??
+        raw?.drsAllowed ??
+        raw?.drsActivatable ??
+        raw?.drsReady,
+      false
+    ),
+    drsActivationDistanceM: finiteNumberOrNull(
+      raw?.drsActivationDistanceM ??
+        raw?.drsActivationDistance ??
+        raw?.drsDistanceM
+    ),
+    drsActivationDelayMs: finiteNumberOrNull(
+      raw?.drsActivationDelayMs ??
+        raw?.drsDelayMs ??
+        raw?.drsReactionMs
+    ),
+    drsActivationDelayDistanceM: finiteNumberOrNull(
+      raw?.drsActivationDelayDistanceM ??
+        raw?.drsDelayDistanceM ??
+        raw?.drsReactionDistanceM
+    ),
     currentSector: parseInteger(raw?.currentSector, null),
   };
 }
@@ -3559,6 +3581,63 @@ function apexCornerEvidenceText(corner) {
   );
 }
 
+function buildReportDrsStats(samples) {
+  const drsActiveCount = samples.filter((sample) => sample.drs === true).length;
+  const availableCount = samples.filter((sample) => sample.drsAvailable === true).length;
+  const explicitDelays = samples
+    .map((sample) => finiteNumberOrNull(sample.drsActivationDelayMs))
+    .filter((value) => value !== null && value >= 0);
+  const explicitDistances = samples
+    .map((sample) => finiteNumberOrNull(sample.drsActivationDelayDistanceM))
+    .filter((value) => value !== null && value >= 0);
+  const activationDelays = [...explicitDelays];
+  const activationDistances = [...explicitDistances];
+
+  if (!activationDelays.length) {
+    let availableStart = null;
+    let wasAvailable = false;
+    let wasActive = false;
+
+    for (const sample of samples) {
+      const available = sample.drsAvailable === true;
+      const active = sample.drs === true;
+
+      if (available && !wasAvailable && !active) {
+        availableStart = sample;
+      }
+
+      if (availableStart && active && !wasActive) {
+        const delaySec = reportDurationBetween(availableStart, sample, null);
+        if (delaySec !== null) activationDelays.push(delaySec * 1000);
+
+        const startDistance = finiteNumberOrNull(availableStart.lapDistance);
+        const endDistance = finiteNumberOrNull(sample.lapDistance);
+        if (startDistance !== null && endDistance !== null) {
+          activationDistances.push(Math.max(0, endDistance - startDistance));
+        }
+
+        availableStart = null;
+      }
+
+      if (!available) availableStart = null;
+      wasAvailable = available;
+      wasActive = active;
+    }
+  }
+
+  return stripUndefinedDeep({
+    used: drsActiveCount > 0,
+    activeSampleCount: drsActiveCount,
+    activePct: samples.length ? reportRound((drsActiveCount / samples.length) * 100, 1) : 0,
+    availableSampleCount: availableCount,
+    availablePct: samples.length ? reportRound((availableCount / samples.length) * 100, 1) : 0,
+    activationCount: activationDelays.length,
+    avgActivationDelayMs: reportRound(reportAvg(activationDelays), 0),
+    bestActivationDelayMs: activationDelays.length ? reportRound(Math.min(...activationDelays), 0) : null,
+    worstActivationDelayMs: activationDelays.length ? reportRound(Math.max(...activationDelays), 0) : null,
+    avgActivationDelayDistanceM: reportRound(reportAvg(activationDistances), 1),
+  });
+}
 function apexCornerCoachingTip(corner) {
   const deltas = corner.deltas || {};
   if (corner.exitMeasurementConfidence === "high" && (deltas.exitDistanceDeltaM ?? 0) >= 12) {
@@ -3614,6 +3693,7 @@ function summarizeReportLap(lapNumber, rawSamples, lapDoc, corners) {
     maxAbsSteering: steerings.length ? reportRound(Math.max(...steerings.map((value) => Math.abs(value))), 3) : null,
     steeringSmoothness: reportRound(reportSteeringSmoothness(samples), 4),
     drsPct: reportRound(reportRatio(samples, (sample) => sample.drs === true), 1),
+    drs: buildReportDrsStats(samples),
     bestDeltaToPbMs: deltas.length ? reportRound(Math.min(...deltas), 1) : null,
     finalDeltaToPbMs: deltas.length ? reportRound(deltas[deltas.length - 1], 1) : null,
     brakingZoneCount: brakingRuns.length,
@@ -4993,6 +5073,64 @@ function lapPerfBuildBrakingStats(samples) {
   });
 }
 
+function lapPerfBuildDrsStats(samples) {
+  const activeCount = samples.filter((sample) => parseBoolean(sample.drs, false) === true).length;
+  const availableCount = samples.filter((sample) => parseBoolean(sample.drsAvailable, false) === true).length;
+  const delayValues = samples
+    .map((sample) => finiteNumberOrNull(sample.drsActivationDelayMs))
+    .filter((value) => value !== null && value >= 0);
+  const distanceValues = samples
+    .map((sample) => finiteNumberOrNull(sample.drsActivationDelayDistanceM))
+    .filter((value) => value !== null && value >= 0);
+
+  if (!delayValues.length) {
+    let availableStart = null;
+    let wasAvailable = false;
+    let wasActive = false;
+
+    for (const sample of lapPerfSortSamples(samples)) {
+      const available = parseBoolean(sample.drsAvailable, false) === true;
+      const active = parseBoolean(sample.drs, false) === true;
+
+      if (available && !wasAvailable && !active) {
+        availableStart = sample;
+      }
+
+      if (availableStart && active && !wasActive) {
+        const startTime = reportTimestampMs(availableStart.timestamp);
+        const endTime = reportTimestampMs(sample.timestamp);
+        if (startTime !== null && endTime !== null && endTime >= startTime) {
+          delayValues.push(endTime - startTime);
+        }
+
+        const startDistance = finiteNumberOrNull(availableStart.lapDistance);
+        const endDistance = finiteNumberOrNull(sample.lapDistance);
+        if (startDistance !== null && endDistance !== null) {
+          distanceValues.push(Math.max(0, endDistance - startDistance));
+        }
+
+        availableStart = null;
+      }
+
+      if (!available) availableStart = null;
+      wasAvailable = available;
+      wasActive = active;
+    }
+  }
+
+  return stripUndefinedDeep({
+    used: activeCount > 0,
+    activeSampleCount: activeCount,
+    activePct: samples.length ? lapPerfRound((activeCount / samples.length) * 100, 1) : 0,
+    availableSampleCount: availableCount,
+    availablePct: samples.length ? lapPerfRound((availableCount / samples.length) * 100, 1) : 0,
+    activationCount: delayValues.length,
+    avgActivationDelayMs: lapPerfAvg(delayValues, 0),
+    bestActivationDelayMs: lapPerfMin(delayValues, 0),
+    worstActivationDelayMs: lapPerfMax(delayValues, 0),
+    avgActivationDelayDistanceM: lapPerfAvg(distanceValues, 1),
+  });
+}
 function lapPerfBuildCorneringStats(samples, corners) {
   const cornerMinSpeeds = (corners || [])
     .map((corner) => finiteNumberOrNull(corner.minSpeedKph))
@@ -5050,6 +5188,10 @@ function lapPerfBuildTraces(samples, maxSamples) {
       corneringSpeedKph: lapPerfRound(sample.corneringSpeed, 1),
       brakingDistanceM: lapPerfRound(sample.brakingDistance, 1),
       drs: parseBoolean(sample.drs, false) === true,
+      drsAvailable: parseBoolean(sample.drsAvailable, false) === true,
+      drsActivationDistanceM: lapPerfRound(sample.drsActivationDistanceM, 1),
+      drsActivationDelayMs: lapPerfRound(sample.drsActivationDelayMs, 0),
+      drsActivationDelayDistanceM: lapPerfRound(sample.drsActivationDelayDistanceM, 1),
       sector: parseInteger(sample.currentSector, null),
     });
   });
@@ -5215,7 +5357,7 @@ app.get("/sessions/:id/laps/:lapId/performance", optionalAuthenticate, async (re
         }
       : {};
 
-    const drsActiveCount = lapSamples.filter((sample) => parseBoolean(sample.drs, false) === true).length;
+    const drsStats = lapPerfBuildDrsStats(lapSamples);
 
     res.json(stripUndefinedDeep({
       session: {
@@ -5271,11 +5413,7 @@ app.get("/sessions/:id/laps/:lapId/performance", optionalAuthenticate, async (re
         },
         cornering: lapPerfBuildCorneringStats(lapSamples, corners),
         braking: lapPerfBuildBrakingStats(lapSamples),
-        drs: {
-          used: drsActiveCount > 0,
-          activeSampleCount: drsActiveCount,
-          activePct: lapSamples.length ? lapPerfRound((drsActiveCount / lapSamples.length) * 100, 1) : 0,
-        },
+        drs: drsStats,
       },
       apexCornerAnalysis: reportLapData?.apexCornerAnalysis || null,
       traces,
@@ -5953,5 +6091,6 @@ start().catch((err) => {
   console.error("Startup error:", err);
   process.exit(1);
 });
+
 
 
