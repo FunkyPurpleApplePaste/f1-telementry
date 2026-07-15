@@ -244,19 +244,72 @@ function trackKeyFrom(trackId, trackName) {
 
 // LEADERBOARD_FUNCTIONAL_PATCH
 const LEADERBOARD_DEFAULT_LIMIT = Number(process.env.LEADERBOARD_DEFAULT_LIMIT || 50);
-const LEADERBOARD_SESSION_SCAN_LIMIT = Number(process.env.LEADERBOARD_SESSION_SCAN_LIMIT || 250);
+const LEADERBOARD_SESSION_SCAN_LIMIT = Number(process.env.LEADERBOARD_SESSION_SCAN_LIMIT || 500);
 const LEADERBOARD_MIN_VALID_LAP_MS = Number(process.env.LEADERBOARD_MIN_VALID_LAP_MS || 10000);
 const LEADERBOARD_MAX_VALID_LAP_MS = Number(process.env.LEADERBOARD_MAX_VALID_LAP_MS || 600000);
+const LEADERBOARD_SCOPE_LABELS = {
+  all: "All Time",
+  weekly: "Weekly",
+  daily: "Daily",
+};
 
 function leaderboardTimestampMs(value) {
   if (!value) return 0;
   if (typeof value.toDate === "function") return value.toDate().getTime();
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (typeof value.seconds === "number") {
+    return value.seconds * 1000 + Math.floor(Number(value.nanoseconds || 0) / 1000000);
+  }
   if (typeof value === "string") {
     const parsed = Date.parse(value);
     return Number.isFinite(parsed) ? parsed : 0;
   }
   if (typeof value === "number") return value;
   return 0;
+}
+
+function normalizeLeaderboardScope(value) {
+  const scope = safeString(value, "all").toLowerCase();
+  if (["day", "daily", "today", "24h", "24hr"].includes(scope)) return "daily";
+  if (["week", "weekly", "7d", "7day", "7days"].includes(scope)) return "weekly";
+  return "all";
+}
+
+function leaderboardScopeWindow(scope, nowMs = Date.now()) {
+  if (scope === "daily") {
+    return {
+      scope,
+      label: LEADERBOARD_SCOPE_LABELS.daily,
+      startMs: nowMs - 24 * 60 * 60 * 1000,
+      endMs: nowMs,
+    };
+  }
+
+  if (scope === "weekly") {
+    return {
+      scope,
+      label: LEADERBOARD_SCOPE_LABELS.weekly,
+      startMs: nowMs - 7 * 24 * 60 * 60 * 1000,
+      endMs: nowMs,
+    };
+  }
+
+  return {
+    scope: "all",
+    label: LEADERBOARD_SCOPE_LABELS.all,
+    startMs: null,
+    endMs: nowMs,
+  };
+}
+
+function leaderboardEntryActivityMs(entry) {
+  return entry?.sortRecordedAtMs || entry?.sortStartedAtMs || 0;
+}
+
+function isLeaderboardEntryInScope(entry, scopeWindow) {
+  if (!scopeWindow?.startMs) return true;
+  const activityMs = leaderboardEntryActivityMs(entry);
+  return activityMs >= scopeWindow.startMs && activityMs <= scopeWindow.endMs;
 }
 
 function isRealValidLeaderboardLap(lap) {
@@ -2023,12 +2076,18 @@ app.get("/leaderboard", async (req, res) => {
     const scanLimitValue = parseInteger(req.query.scanLimit, LEADERBOARD_SESSION_SCAN_LIMIT) || LEADERBOARD_SESSION_SCAN_LIMIT;
     const sessionScanLimit = Math.max(limitRows, Math.min(scanLimitValue, 500));
     const requestedTrackKey = safeString(req.query.trackKey, null);
+    const requestedScope = normalizeLeaderboardScope(req.query.scope);
+    const scopeWindow = leaderboardScopeWindow(requestedScope);
     const trackIdFilter = parseInteger(req.query.trackId, null);
     const trackNameFilter = safeString(req.query.trackName, null);
     const normalizedTrackNameFilter = trackNameFilter ? normalizeUsername(trackNameFilter) : null;
 
-    const sessionsSnap = await db
-      .collection("sessions")
+    let sessionsQuery = db.collection("sessions");
+    if (scopeWindow.startMs) {
+      sessionsQuery = sessionsQuery.where("startedAt", ">=", new Date(scopeWindow.startMs));
+    }
+
+    const sessionsSnap = await sessionsQuery
       .orderBy("startedAt", "desc")
       .limit(sessionScanLimit)
       .get();
@@ -2070,6 +2129,7 @@ app.get("/leaderboard", async (req, res) => {
 
         const entry = buildLeaderboardEntry(sessionDoc, sessionData, lapDoc, lapData);
         if (!entry.trackKey) continue;
+        if (!isLeaderboardEntryInScope(entry, scopeWindow)) continue;
 
         const stats = ensureTrack(entry);
         stats.validLaps += 1;
@@ -2135,7 +2195,10 @@ app.get("/leaderboard", async (req, res) => {
     const activeBestByUser = activeTrackKey
       ? bestByTrackAndUser.get(activeTrackKey) || new Map()
       : new Map();
-    const rows = rankLeaderboardEntries([...activeBestByUser.values()]).slice(0, limitRows);
+    const rows = [];
+    for (const [, bestByUser] of bestByTrackAndUser) {
+      rows.push(...rankLeaderboardEntries([...bestByUser.values()]).slice(0, limitRows));
+    }
 
     res.json({
       rows,
@@ -2146,6 +2209,7 @@ app.get("/leaderboard", async (req, res) => {
         trackKey: activeTrackKey,
         trackId: activeTrack?.trackId ?? trackIdFilter,
         trackName: activeTrack?.trackName ?? trackNameFilter,
+        scope: scopeWindow.scope,
       },
       meta: {
         leaderboardType: "best_valid_actual_lap_per_user_per_track",
@@ -2156,6 +2220,11 @@ app.get("/leaderboard", async (req, res) => {
           "Lap time must be a real lapTimeMs, not theoretical best.",
           "Each user appears once per track with their fastest eligible lap.",
         ],
+        timeScope: scopeWindow.scope,
+        timeScopeLabel: scopeWindow.label,
+        timeWindowStartMs: scopeWindow.startMs,
+        timeWindowEndMs: scopeWindow.endMs,
+        generatedAt: new Date(scopeWindow.endMs).toISOString(),
         scannedSessions,
         scannedLaps,
         validLaps,
