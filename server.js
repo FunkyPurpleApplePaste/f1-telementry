@@ -5242,6 +5242,101 @@ function lapPerfBuildTraces(samples, maxSamples) {
   });
 }
 
+function sessionPerfBuildTraces(samples, maxSamples) {
+  const sorted = lapPerfSortSamples(samples);
+  const sampled = downsampleReportSamples(sorted, maxSamples);
+  const firstTotalDistance =
+    sampled.find((sample) => finiteNumberOrNull(sample.totalDistance) !== null)?.totalDistance ?? null;
+
+  return sampled.map((sample, index) => {
+    const totalDistance = finiteNumberOrNull(sample.totalDistance);
+    const lapDistance = finiteNumberOrNull(sample.lapDistance);
+    const distanceM =
+      totalDistance !== null && firstTotalDistance !== null
+        ? Math.max(0, totalDistance - firstTotalDistance)
+        : index;
+
+    return stripUndefinedDeep({
+      index,
+      sampleIndex: parseInteger(sample.sampleIndex, null),
+      timestamp: sample.timestamp || null,
+      lapNumber: parseInteger(sample.lapNumber, null),
+      lapDistance: lapPerfRound(lapDistance, 2),
+      totalDistance: lapPerfRound(totalDistance, 2),
+      distanceM: lapPerfRound(distanceM, 2),
+      worldX: lapPerfRound(sample.worldX, 3),
+      worldY: lapPerfRound(sample.worldY, 3),
+      worldZ: lapPerfRound(sample.worldZ, 3),
+      steering: lapPerfRound(sample.steering, 4),
+      speedKph: lapPerfRound(sample.speedKph, 1),
+      throttlePct: lapPerfControlPct(sample.throttle),
+      brakePct: lapPerfControlPct(sample.brake),
+      rpm: parseInteger(sample.rpm, null),
+      gear: parseInteger(sample.gear, null),
+      deltaToPB: lapPerfRound(sample.deltaToPB, 3),
+      corneringSpeedKph: lapPerfRound(sample.corneringSpeed, 1),
+      brakingDistanceM: lapPerfRound(sample.brakingDistance, 1),
+      drs: parseBoolean(sample.drs, false) === true,
+      drsAvailable: parseBoolean(sample.drsAvailable, false) === true,
+      drsActivationDelayMs: lapPerfRound(sample.drsActivationDelayMs, 0),
+      drsActivationDelayDistanceM: lapPerfRound(sample.drsActivationDelayDistanceM, 1),
+      sector: parseInteger(sample.currentSector, null),
+    });
+  });
+}
+
+function sessionPerfNormalizeLap(lapData, bestLapTimeMs = null) {
+  const lapTimeMs = parseInteger(lapData.lapTimeMs, null);
+  const sector1Ms = parseInteger(lapData.sector1Ms, null);
+  const sector2Ms = parseInteger(lapData.sector2Ms, null);
+  const sector3Ms = parseInteger(lapData.sector3Ms, null);
+
+  return stripUndefinedDeep({
+    id: lapData.id,
+    lapNumber: parseInteger(lapData.lapNumber, null),
+    lapTimeMs,
+    lapTime: formatLapTime(lapTimeMs),
+    sector1Ms,
+    sector2Ms,
+    sector3Ms,
+    sector1Time: formatLapTime(sector1Ms),
+    sector2Time: formatLapTime(sector2Ms),
+    sector3Time: formatLapTime(sector3Ms),
+    valid: lapData.valid === true,
+    recordedAt: lapData.recordedAt || null,
+    gapToBestMs:
+      bestLapTimeMs !== null && lapTimeMs !== null
+        ? lapTimeMs - bestLapTimeMs
+        : null,
+  });
+}
+
+function sessionPerfBuildStats(samples, laps) {
+  const speeds = samples.map((sample) => sample.speedKph).filter((value) => Number.isFinite(Number(value)));
+  const validLaps = laps.filter((lap) => lap.valid === true && parseInteger(lap.lapTimeMs, null) !== null);
+  const bestLap = validLaps.reduce((best, lap) => {
+    const lapTimeMs = parseInteger(lap.lapTimeMs, null);
+    if (lapTimeMs === null) return best;
+    if (!best || lapTimeMs < best.lapTimeMs) {
+      return { ...lap, lapTimeMs };
+    }
+    return best;
+  }, null);
+
+  return stripUndefinedDeep({
+    sampleCount: samples.length,
+    rawSampleCount: samples.rawSampleCount ?? samples.length,
+    lapCount: laps.length,
+    validLapCount: validLaps.length,
+    bestLap: bestLap ? sessionPerfNormalizeLap(bestLap) : null,
+    topSpeedKph: speeds.length ? lapPerfRound(Math.max(...speeds), 1) : null,
+    averageSpeedKph: lapPerfAvg(speeds, 1),
+    averageThrottlePct: lapPerfAvg(samples.map((sample) => lapPerfControlPct(sample.throttle)), 1),
+    averageBrakePct: lapPerfAvg(samples.map((sample) => lapPerfControlPct(sample.brake)), 1),
+    drs: lapPerfBuildDrsStats(samples),
+  });
+}
+
 // LAP_PERFORMANCE_SPEED_PATCH
 const lapPerfPersonalBestCache = new Map();
 const LAP_PERF_PB_CACHE_MS = 5 * 60 * 1000;
@@ -5310,6 +5405,104 @@ async function lapPerfFindPersonalBest(userId, trackKey) {
   });
   return best;
 }
+
+app.get("/sessions/:id/performance", authenticate, async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
+    const maxSamples = Math.max(180, Math.min(parseInteger(req.query.maxSamples, 1000) || 1000, 2000));
+
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required" });
+    }
+
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
+    const sessionData = serializeDoc(sessionSnap);
+    if (!requireReadableSession(req, res, sessionData)) return;
+
+    const laps = await collectSessionLapDocs(sessionRef);
+    const lapNumbers = uniqueSortedLapNumbers(
+      laps.map((lap) => parseInteger(lap.lapNumber, null)).filter((lapNumber) => lapNumber !== null)
+    );
+    const maxSamplesPerLap = lapNumbers.length
+      ? Math.max(30, Math.ceil(maxSamples / lapNumbers.length))
+      : Math.max(120, Math.min(maxSamples, 500));
+
+    const [samples, reportSnap] = await Promise.all([
+      collectSessionTelemetrySamples(sessionRef, {
+        targetLapNumbers: lapNumbers,
+        maxSamplesPerLap,
+        maxTotalSamples: maxSamples,
+        maxAnalyzedLaps: Math.max(1, lapNumbers.length || MAX_FINAL_REPORT_ANALYZED_LAPS),
+        chunkPageSize: 20,
+      }),
+      sessionRef
+        .collection("reports")
+        .doc("postSession")
+        .get()
+        .catch(() => null),
+    ]);
+
+    const stats = sessionPerfBuildStats(samples, laps);
+    const bestLapTimeMs = stats.bestLap?.lapTimeMs ?? null;
+    const reportData = reportSnap?.exists ? serializeDoc(reportSnap) : null;
+    const trackKey =
+      safeString(sessionData.trackKey, null) ||
+      trackKeyFrom(sessionData.trackId, sessionData.trackName);
+
+    res.json(stripUndefinedDeep({
+      session: {
+        id: sessionId,
+        userId: safeString(sessionData.userId, null),
+        username: safeString(sessionData.username, null),
+        email: safeString(sessionData.email, null),
+        trackName: safeString(sessionData.trackName, null),
+        trackId: parseInteger(sessionData.trackId, null),
+        trackKey,
+        sessionType: parseInteger(sessionData.sessionType, null),
+        startedAt: sessionData.startedAt || null,
+        endedAt: sessionData.endedAt || null,
+        latestTelemetryAt: sessionData.latestTelemetryAt || null,
+        postSessionReportStatus: safeString(sessionData.postSessionReportStatus, null),
+        postSessionReportSummary: sessionData.postSessionReportSummary || null,
+      },
+      stats,
+      laps: laps.map((lap) => sessionPerfNormalizeLap(lap, bestLapTimeMs)),
+      traces: sessionPerfBuildTraces(samples, maxSamples),
+      report: reportData
+        ? {
+            id: reportData.id,
+            schema: reportData.schema || null,
+            status: reportData.status || null,
+            reportPhase: reportData.reportPhase || null,
+            reportTrigger: reportData.reportTrigger || null,
+            dataQuality: reportData.dataQuality || null,
+            sessionSnapshot: reportData.sessionSnapshot || null,
+            bestLap: reportData.bestLap || null,
+            theoreticalBestLap: reportData.theoreticalBestLap || null,
+            worstLap: reportData.worstLap || null,
+            topCoachSignals: reportData.topCoachSignals || [],
+            precisionFindings: reportData.precisionFindings || [],
+            aiReadableMarkdown: reportData.aiReadableMarkdown || null,
+            summary: reportData.summary || null,
+          }
+        : null,
+      meta: {
+        analysisType: "post_session_performance",
+        maxSamples,
+        maxSamplesPerLap,
+      },
+    }));
+  } catch (err) {
+    console.error("GET /sessions/:id/performance error:", err);
+    res.status(500).json({ error: "failed to fetch session performance" });
+  }
+});
 
 app.get("/sessions/:id/laps/:lapId/performance", optionalAuthenticate, async (req, res) => {
   try {
