@@ -3993,6 +3993,16 @@ function buildPostSessionCoachSignals(lapSummaries, precisionFindings, bestLap) 
       );
     }
 
+    if ((lap.drs?.avgActivationDelayMs ?? 0) >= 450 && (lap.drs?.activationCount ?? 0) > 0) {
+      add(
+        "medium",
+        "DRS reaction",
+        lap.lapNumber,
+        label + ": average DRS activation delay was " + reportFormatNumber(lap.drs.avgActivationDelayMs / 1000, 2, " sec") + " across " + lap.drs.activationCount + " activations.",
+        "When DRS becomes available, activate it immediately on straights unless car balance or race situation says otherwise. Delayed DRS costs free top speed."
+      );
+    }
+
     if ((lap.heavyBrakePct ?? 0) >= 16) {
       add(
         "medium",
@@ -4169,6 +4179,10 @@ function renderPostSessionMarkdown(report) {
       "- Heavy brake: " + reportFormatPct(lap.heavyBrakePct),
       "- Coasting: " + reportFormatPct(lap.coastingPct),
       "- Pedal overlap: " + reportFormatPct(lap.throttleBrakeOverlapPct),
+      "- DRS active: " + reportFormatPct(lap.drs?.activePct ?? lap.drsPct),
+      "- DRS ready: " + reportFormatPct(lap.drs?.availablePct),
+      "- DRS reaction delay: " + (lap.drs?.avgActivationDelayMs != null ? reportFormatNumber(lap.drs.avgActivationDelayMs / 1000, 2, " sec") : "-") +
+        (lap.drs?.activationCount ? " across " + lap.drs.activationCount + " activations" : ""),
       "- Steering smoothness: " + reportFormatNumber(lap.steeringSmoothness, 4),
       ""
     );
@@ -6091,6 +6105,7 @@ start().catch((err) => {
   console.error("Startup error:", err);
   process.exit(1);
 });
+
 
 
 
