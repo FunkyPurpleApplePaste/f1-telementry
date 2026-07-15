@@ -2667,14 +2667,43 @@ function downsampleReportSamples(samples, maxSamples) {
   if (!Array.isArray(samples) || samples.length <= maxSamples) return samples;
   if (maxSamples <= 0) return [];
 
-  const out = [];
-  const step = (samples.length - 1) / Math.max(1, maxSamples - 1);
-
-  for (let i = 0; i < maxSamples; i += 1) {
-    out.push(samples[Math.round(i * step)]);
+  const importantIndexes = [];
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = samples[index];
+    if (
+      finiteNumberOrNull(sample?.drsActivationDelayMs) !== null ||
+      finiteNumberOrNull(sample?.drsActivationDelayDistanceM) !== null
+    ) {
+      importantIndexes.push(index);
+    }
   }
 
-  return out;
+  if (importantIndexes.length >= maxSamples) {
+    const out = [];
+    const step = (importantIndexes.length - 1) / Math.max(1, maxSamples - 1);
+    for (let i = 0; i < maxSamples; i += 1) {
+      out.push(samples[importantIndexes[Math.round(i * step)]]);
+    }
+    return out;
+  }
+
+  const picked = new Map();
+  for (const index of importantIndexes) {
+    picked.set(index, samples[index]);
+  }
+
+  const remainingSlots = maxSamples - picked.size;
+  const step = (samples.length - 1) / Math.max(1, remainingSlots - 1);
+
+  for (let i = 0; i < remainingSlots; i += 1) {
+    const index = Math.round(i * step);
+    picked.set(index, samples[index]);
+  }
+
+  return [...picked.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .slice(0, maxSamples)
+    .map(([, sample]) => sample);
 }
 
 function uniqueSortedLapNumbers(values) {
@@ -3834,6 +3863,7 @@ function buildLapComparisonTable(lapSummaries, bestLap, theoreticalBestLap = nul
     heavyBrakePct: lap.heavyBrakePct,
     coastingPct: lap.coastingPct,
     throttleBrakeOverlapPct: lap.throttleBrakeOverlapPct,
+    drs: lap.drs,
     avgAbsSteering: lap.avgAbsSteering,
     brakingZoneCount: lap.brakingZoneCount,
     corneringZoneCount: lap.corneringZoneCount,
@@ -4451,6 +4481,7 @@ function compactLapForMainReport(lap) {
     heavyBrakePct: lap.heavyBrakePct,
     coastingPct: lap.coastingPct,
     throttleBrakeOverlapPct: lap.throttleBrakeOverlapPct,
+    drs: lap.drs,
     avgAbsSteering: lap.avgAbsSteering,
     steeringSmoothness: lap.steeringSmoothness,
     brakingZoneCount: lap.brakingZoneCount,
@@ -6105,6 +6136,9 @@ start().catch((err) => {
   console.error("Startup error:", err);
   process.exit(1);
 });
+
+
+
 
 
 
