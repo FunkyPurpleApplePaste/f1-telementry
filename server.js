@@ -260,6 +260,9 @@ function leaderboardTimestampMs(value) {
   if (typeof value.seconds === "number") {
     return value.seconds * 1000 + Math.floor(Number(value.nanoseconds || 0) / 1000000);
   }
+  if (typeof value._seconds === "number") {
+    return value._seconds * 1000 + Math.floor(Number(value._nanoseconds || 0) / 1000000);
+  }
   if (typeof value === "string") {
     const parsed = Date.parse(value);
     return Number.isFinite(parsed) ? parsed : 0;
@@ -268,6 +271,9 @@ function leaderboardTimestampMs(value) {
   return 0;
 }
 
+function maxLeaderboardTimestampMs(...values) {
+  return values.reduce((best, value) => Math.max(best, leaderboardTimestampMs(value)), 0);
+}
 function normalizeLeaderboardScope(value) {
   const scope = safeString(value, "all").toLowerCase();
   if (["day", "daily", "today", "24h", "24hr"].includes(scope)) return "daily";
@@ -303,9 +309,36 @@ function leaderboardScopeWindow(scope, nowMs = Date.now()) {
 }
 
 function leaderboardEntryActivityMs(entry) {
-  return entry?.sortRecordedAtMs || entry?.sortStartedAtMs || 0;
+  return (
+    entry?.activityMs ||
+    entry?.sortActivityMs ||
+    entry?.sortRecordedAtMs ||
+    maxLeaderboardTimestampMs(
+      entry?.recordedAt,
+      entry?.completedAt,
+      entry?.sessionEndedAt,
+      entry?.endedAt,
+      entry?.sessionLatestTelemetryAt,
+      entry?.latestTelemetryAt,
+      entry?.sessionUpdatedAt,
+      entry?.updatedAt,
+      entry?.sessionStartedAt,
+      entry?.startedAt,
+      entry?.sessionCreatedAt,
+      entry?.createdAt
+    )
+  );
 }
 
+function leaderboardSessionActivityMs(sessionData) {
+  return maxLeaderboardTimestampMs(
+    sessionData?.endedAt,
+    sessionData?.latestTelemetryAt,
+    sessionData?.updatedAt,
+    sessionData?.startedAt,
+    sessionData?.createdAt
+  );
+}
 function isLeaderboardEntryInScope(entry, scopeWindow) {
   if (!scopeWindow?.startMs) return true;
   const activityMs = leaderboardEntryActivityMs(entry);
@@ -336,6 +369,24 @@ function buildLeaderboardEntry(sessionDoc, sessionData, lapDoc, lapData) {
   const trackId = parseInteger(lapData.trackId ?? sessionData.trackId, null);
   const trackName = safeString(lapData.trackName ?? sessionData.trackName, null);
   const trackKey = trackKeyFrom(trackId, trackName);
+  const sortRecordedAtMs = maxLeaderboardTimestampMs(
+    lapData.recordedAt,
+    lapData.completedAt,
+    lapData.createdAt
+  );
+  const sortStartedAtMs = leaderboardTimestampMs(sessionData.startedAt);
+  const sortEndedAtMs = leaderboardTimestampMs(sessionData.endedAt);
+  const sortLatestTelemetryAtMs = leaderboardTimestampMs(sessionData.latestTelemetryAt);
+  const sortUpdatedAtMs = leaderboardTimestampMs(sessionData.updatedAt);
+  const sortCreatedAtMs = leaderboardTimestampMs(sessionData.createdAt);
+  const sortActivityMs = Math.max(
+    sortRecordedAtMs,
+    sortEndedAtMs,
+    sortLatestTelemetryAtMs,
+    sortUpdatedAtMs,
+    sortStartedAtMs,
+    sortCreatedAtMs
+  );
 
   return stripUndefinedDeep({
     userId: safeString(sessionData.userId, null),
@@ -355,16 +406,22 @@ function buildLeaderboardEntry(sessionDoc, sessionData, lapDoc, lapData) {
     trackKey,
     sessionType: parseInteger(sessionData.sessionType, null),
     sessionStartedAt: sessionData.startedAt || null,
-    recordedAt: lapData.recordedAt || null,
-    sortStartedAtMs: leaderboardTimestampMs(sessionData.startedAt),
-    sortRecordedAtMs: leaderboardTimestampMs(lapData.recordedAt),
+    sessionEndedAt: sessionData.endedAt || null,
+    sessionLatestTelemetryAt: sessionData.latestTelemetryAt || null,
+    sessionUpdatedAt: sessionData.updatedAt || null,
+    sessionCreatedAt: sessionData.createdAt || null,
+    recordedAt: lapData.recordedAt || lapData.completedAt || lapData.createdAt || null,
+    activityMs: sortActivityMs,
+    sortActivityMs,
+    sortStartedAtMs,
+    sortRecordedAtMs,
   });
 }
 
 function rankLeaderboardEntries(entries) {
   const sorted = [...entries].sort((a, b) => {
     if (a.lapTimeMs !== b.lapTimeMs) return a.lapTimeMs - b.lapTimeMs;
-    if (a.sortRecordedAtMs !== b.sortRecordedAtMs) return b.sortRecordedAtMs - a.sortRecordedAtMs;
+    if (leaderboardEntryActivityMs(a) !== leaderboardEntryActivityMs(b)) return leaderboardEntryActivityMs(b) - leaderboardEntryActivityMs(a);
     return String(a.username || "").localeCompare(String(b.username || ""));
   });
 
@@ -2069,6 +2126,58 @@ app.get("/sessions", authenticate, async (req, res) => {
   }
 });
 
+async function fetchLeaderboardSessionDocs(sessionScanLimit, scopeWindow) {
+  const seen = new Map();
+  const dateFields = ["startedAt", "endedAt", "latestTelemetryAt", "updatedAt", "createdAt"];
+
+  function addSnapshot(snapshot) {
+    for (const doc of snapshot.docs) {
+      seen.set(doc.id, doc);
+    }
+  }
+
+  for (const field of dateFields) {
+    try {
+      let q = db.collection("sessions");
+      if (scopeWindow?.startMs) {
+        q = q.where(field, ">=", new Date(scopeWindow.startMs));
+      }
+      const snap = await q.orderBy(field, "desc").limit(sessionScanLimit).get();
+      addSnapshot(snap);
+    } catch (err) {
+      console.warn(`Leaderboard session query skipped for ${field}:`, err.message || err);
+    }
+  }
+
+  if (seen.size === 0) {
+    try {
+      addSnapshot(await db.collection("sessions").limit(sessionScanLimit).get());
+    } catch (err) {
+      console.warn("Leaderboard unordered session query skipped:", err.message || err);
+    }
+  }
+
+  return [...seen.values()]
+    .sort((a, b) => leaderboardSessionActivityMs(b.data() || {}) - leaderboardSessionActivityMs(a.data() || {}))
+    .slice(0, sessionScanLimit);
+}
+
+async function fetchLeaderboardScopedLapDocs(scopeWindow, scanLimit) {
+  if (!scopeWindow?.startMs) return [];
+
+  try {
+    const snap = await db
+      .collectionGroup("laps")
+      .where("recordedAt", ">=", new Date(scopeWindow.startMs))
+      .orderBy("recordedAt", "desc")
+      .limit(Math.max(scanLimit * 10, 250))
+      .get();
+    return snap.docs;
+  } catch (err) {
+    console.warn("Leaderboard collectionGroup lap query skipped:", err.message || err);
+    return [];
+  }
+}
 app.get("/leaderboard", async (req, res) => {
   try {
     const limitValue = parseInteger(req.query.limit, LEADERBOARD_DEFAULT_LIMIT) || LEADERBOARD_DEFAULT_LIMIT;
@@ -2082,15 +2191,10 @@ app.get("/leaderboard", async (req, res) => {
     const trackNameFilter = safeString(req.query.trackName, null);
     const normalizedTrackNameFilter = trackNameFilter ? normalizeUsername(trackNameFilter) : null;
 
-    let sessionsQuery = db.collection("sessions");
-    if (scopeWindow.startMs) {
-      sessionsQuery = sessionsQuery.where("startedAt", ">=", new Date(scopeWindow.startMs));
-    }
-
-    const sessionsSnap = await sessionsQuery
-      .orderBy("startedAt", "desc")
-      .limit(sessionScanLimit)
-      .get();
+    const sessionDocs = await fetchLeaderboardSessionDocs(sessionScanLimit, scopeWindow);
+    const scopedLapDocs = await fetchLeaderboardScopedLapDocs(scopeWindow, sessionScanLimit);
+    const sessionDocCache = new Map(sessionDocs.map((doc) => [doc.id, doc]));
+    const seenLapPaths = new Set();
 
     const bestByTrackAndUser = new Map();
     const trackStats = new Map();
@@ -2114,29 +2218,29 @@ app.get("/leaderboard", async (req, res) => {
       return trackStats.get(key);
     }
 
-    for (const sessionDoc of sessionsSnap.docs) {
-      scannedSessions += 1;
+    async function processSessionLap(sessionDoc, lapDoc) {
+      const lapPath = lapDoc.ref.path;
+      if (seenLapPaths.has(lapPath)) return;
+      seenLapPaths.add(lapPath);
+
       const sessionData = serializeDoc(sessionDoc);
       const userKey = leaderboardUserKey(sessionData);
-      if (!userKey) continue;
+      if (!userKey) return;
 
-      const lapsSnap = await sessionDoc.ref.collection("laps").get();
+      scannedLaps += 1;
+      const lapData = serializeDoc(lapDoc);
+      if (!isRealValidLeaderboardLap(lapData)) return;
 
-      for (const lapDoc of lapsSnap.docs) {
-        scannedLaps += 1;
-        const lapData = serializeDoc(lapDoc);
-        if (!isRealValidLeaderboardLap(lapData)) continue;
-
-        const entry = buildLeaderboardEntry(sessionDoc, sessionData, lapDoc, lapData);
-        if (!entry.trackKey) continue;
-        if (!isLeaderboardEntryInScope(entry, scopeWindow)) continue;
+      const entry = buildLeaderboardEntry(sessionDoc, sessionData, lapDoc, lapData);
+      if (!entry.trackKey) return;
+      if (!isLeaderboardEntryInScope(entry, scopeWindow)) return;
 
         const stats = ensureTrack(entry);
         stats.validLaps += 1;
         stats.userKeys.add(userKey);
         stats.latestActivityMs = Math.max(
           stats.latestActivityMs,
-          entry.sortRecordedAtMs || entry.sortStartedAtMs || 0
+          leaderboardEntryActivityMs(entry)
         );
         if (stats.bestLapTimeMs === null || entry.lapTimeMs < stats.bestLapTimeMs) {
           stats.bestLapTimeMs = entry.lapTimeMs;
@@ -2153,11 +2257,39 @@ app.get("/leaderboard", async (req, res) => {
         if (
           !existing ||
           entry.lapTimeMs < existing.lapTimeMs ||
-          (entry.lapTimeMs === existing.lapTimeMs && entry.sortRecordedAtMs > existing.sortRecordedAtMs)
+          (entry.lapTimeMs === existing.lapTimeMs && leaderboardEntryActivityMs(entry) > leaderboardEntryActivityMs(existing))
         ) {
           bestByUser.set(userKey, entry);
         }
+    }
+
+    const seenSessionIds = new Set();
+    for (const sessionDoc of sessionDocs) {
+      scannedSessions += 1;
+      seenSessionIds.add(sessionDoc.id);
+      const lapsSnap = await sessionDoc.ref.collection("laps").get();
+      for (const lapDoc of lapsSnap.docs) {
+        await processSessionLap(sessionDoc, lapDoc);
       }
+    }
+
+    for (const lapDoc of scopedLapDocs) {
+      const sessionRef = lapDoc.ref.parent.parent;
+      if (!sessionRef) continue;
+
+      let sessionDoc = sessionDocCache.get(sessionRef.id);
+      if (!sessionDoc) {
+        sessionDoc = await sessionRef.get();
+        if (!sessionDoc.exists) continue;
+        sessionDocCache.set(sessionRef.id, sessionDoc);
+      }
+
+      if (!seenSessionIds.has(sessionRef.id)) {
+        scannedSessions += 1;
+        seenSessionIds.add(sessionRef.id);
+      }
+
+      await processSessionLap(sessionDoc, lapDoc);
     }
 
     const tracks = [...trackStats.values()]
@@ -5821,4 +5953,5 @@ start().catch((err) => {
   console.error("Startup error:", err);
   process.exit(1);
 });
+
 
