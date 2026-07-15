@@ -2617,7 +2617,16 @@ function normalizeReportSample(raw, fallbackIndex) {
     throttle: finiteNumberOrNull(raw?.throttle),
     brake: finiteNumberOrNull(raw?.brake),
     steering: finiteNumberOrNull(raw?.steering),
-    rpm: parseInteger(raw?.rpm, null),
+    rpm: parseInteger(
+      raw?.rpm ??
+        raw?.engineRPM ??
+        raw?.engineRpm ??
+        raw?.engine_rpm ??
+        raw?.m_engineRPM ??
+        raw?.m_engineRpm ??
+        raw?.m_engine_rpm,
+      null
+    ),
     gear: parseInteger(raw?.gear, null),
     deltaToPB: finiteNumberOrNull(raw?.deltaToPB),
     corneringSpeed: finiteNumberOrNull(raw?.corneringSpeed),
