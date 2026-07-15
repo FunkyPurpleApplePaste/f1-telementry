@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
@@ -335,7 +335,7 @@ function buildLeaderboardEntry(sessionDoc, sessionData, lapDoc, lapData) {
   const lapTimeMs = parseInteger(lapData.lapTimeMs, null);
   const trackId = parseInteger(lapData.trackId ?? sessionData.trackId, null);
   const trackName = safeString(lapData.trackName ?? sessionData.trackName, null);
-  const trackKey = safeString(sessionData.trackKey, null) || trackKeyFrom(trackId, trackName);
+  const trackKey = trackKeyFrom(trackId, trackName);
 
   return stripUndefinedDeep({
     userId: safeString(sessionData.userId, null),
@@ -5821,3 +5821,4 @@ start().catch((err) => {
   console.error("Startup error:", err);
   process.exit(1);
 });
+
