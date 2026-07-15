@@ -281,7 +281,31 @@ function normalizeLeaderboardScope(value) {
   return "all";
 }
 
-function leaderboardScopeWindow(scope, nowMs = Date.now()) {
+function parseTimezoneOffsetMinutes(value) {
+  const parsed = parseInteger(value, null);
+  if (parsed === null) return 0;
+  return Math.max(-12 * 60, Math.min(14 * 60, parsed));
+}
+
+function calendarWeekStartMs(nowMs, timezoneOffsetMinutes = 0) {
+  const offsetMs = timezoneOffsetMinutes * 60 * 1000;
+  const shifted = new Date(nowMs + offsetMs);
+  const day = shifted.getUTCDay();
+  const daysSinceMonday = (day + 6) % 7;
+  const startShiftedMs = Date.UTC(
+    shifted.getUTCFullYear(),
+    shifted.getUTCMonth(),
+    shifted.getUTCDate() - daysSinceMonday,
+    0,
+    0,
+    0,
+    0
+  );
+
+  return startShiftedMs - offsetMs;
+}
+
+function leaderboardScopeWindow(scope, nowMs = Date.now(), timezoneOffsetMinutes = 0) {
   if (scope === "daily") {
     return {
       scope,
@@ -295,8 +319,10 @@ function leaderboardScopeWindow(scope, nowMs = Date.now()) {
     return {
       scope,
       label: LEADERBOARD_SCOPE_LABELS.weekly,
-      startMs: nowMs - 7 * 24 * 60 * 60 * 1000,
+      startMs: calendarWeekStartMs(nowMs, timezoneOffsetMinutes),
       endMs: nowMs,
+      resetRule: "calendar_week_monday_to_sunday",
+      timezoneOffsetMinutes,
     };
   }
 
@@ -2186,7 +2212,8 @@ app.get("/leaderboard", async (req, res) => {
     const sessionScanLimit = Math.max(limitRows, Math.min(scanLimitValue, 500));
     const requestedTrackKey = safeString(req.query.trackKey, null);
     const requestedScope = normalizeLeaderboardScope(req.query.scope);
-    const scopeWindow = leaderboardScopeWindow(requestedScope);
+    const timezoneOffsetMinutes = parseTimezoneOffsetMinutes(req.query.tzOffsetMinutes);
+    const scopeWindow = leaderboardScopeWindow(requestedScope, Date.now(), timezoneOffsetMinutes);
     const trackIdFilter = parseInteger(req.query.trackId, null);
     const trackNameFilter = safeString(req.query.trackName, null);
     const normalizedTrackNameFilter = trackNameFilter ? normalizeUsername(trackNameFilter) : null;
@@ -2356,6 +2383,8 @@ app.get("/leaderboard", async (req, res) => {
         timeScopeLabel: scopeWindow.label,
         timeWindowStartMs: scopeWindow.startMs,
         timeWindowEndMs: scopeWindow.endMs,
+        timeWindowResetRule: scopeWindow.resetRule || null,
+        timezoneOffsetMinutes: scopeWindow.timezoneOffsetMinutes ?? timezoneOffsetMinutes,
         generatedAt: new Date(scopeWindow.endMs).toISOString(),
         scannedSessions,
         scannedLaps,
