@@ -17,6 +17,10 @@ const port = process.env.PORT || 3001;
 const PASSWORD_MIN_LENGTH = 8;
 const BCRYPT_SALT_ROUNDS = Number(process.env.BCRYPT_SALT_ROUNDS || 12);
 const AUTH_SESSION_DAYS = Number(process.env.AUTH_SESSION_DAYS || 7);
+const LIVE_STREAM_HEARTBEAT_MS = Number(process.env.LIVE_STREAM_HEARTBEAT_MS || 15000);
+const LATEST_FIRESTORE_WRITE_INTERVAL_MS = Number(
+  process.env.LATEST_FIRESTORE_WRITE_INTERVAL_MS || 100
+);
 
 let credential;
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -29,6 +33,65 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 initializeApp({ credential });
 const firebaseAuth = getAuth();
 const db = getFirestore();
+
+const liveTelemetryCache = new Map();
+const liveStreamClients = new Map();
+const latestFirestoreWriteAtBySession = new Map();
+
+function getLiveClientSet(sessionId) {
+  if (!liveStreamClients.has(sessionId)) {
+    liveStreamClients.set(sessionId, new Set());
+  }
+
+  return liveStreamClients.get(sessionId);
+}
+
+function writeLiveStreamEvent(res, event, payload) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function buildLiveTelemetryPayload(
+  sessionId,
+  latestTelemetry,
+  latestMapPosition,
+  sessionData = {}
+) {
+  return stripUndefinedDeep({
+    sessionId,
+    latestTelemetry: latestTelemetry ?? null,
+    latestTelemetryFreshness: telemetryFreshness(latestTelemetry),
+    latestMapPosition: latestMapPosition ?? null,
+    trackKey:
+      sessionData.trackKey ??
+      sessionData.mapSummary?.trackKey ??
+      trackKeyFrom(sessionData.trackId, sessionData.trackName),
+    trackId: parseInteger(sessionData.trackId, null),
+    trackName: safeString(sessionData.trackName, null),
+    serverSentAt: new Date().toISOString(),
+  });
+}
+
+function broadcastLiveTelemetry(sessionId, payload) {
+  if (!sessionId || !payload) return;
+
+  liveTelemetryCache.set(sessionId, payload);
+  const clients = liveStreamClients.get(sessionId);
+  if (!clients || clients.size === 0) return;
+
+  for (const res of [...clients]) {
+    if (res.destroyed || res.writableEnded) {
+      clients.delete(res);
+      continue;
+    }
+
+    try {
+      writeLiveStreamEvent(res, "telemetry", payload);
+    } catch {
+      clients.delete(res);
+    }
+  }
+}
 
 app.use(helmet());
 app.use(cors());
@@ -5187,7 +5250,11 @@ app.post("/telemetry/latest", async (req, res) => {
       return res.json({ success: true, ignored: true, reason: "session ended" });
     }
 
-    if (!isNewerTelemetrySample(latestTelemetry, sessionData.latestTelemetry)) {
+    const cachedLive = liveTelemetryCache.get(sessionId);
+    const currentLatestTelemetry =
+      cachedLive?.latestTelemetry ?? sessionData.latestTelemetry;
+
+    if (!isNewerTelemetrySample(latestTelemetry, currentLatestTelemetry)) {
       return res.json({
         success: true,
         ignored: true,
@@ -5196,6 +5263,29 @@ app.post("/telemetry/latest", async (req, res) => {
     }
 
     const latestMapPosition = buildLatestMapPosition(latestTelemetry);
+    const livePayload = buildLiveTelemetryPayload(
+      sessionId,
+      latestTelemetry,
+      latestMapPosition,
+      sessionData
+    );
+
+    broadcastLiveTelemetry(sessionId, livePayload);
+
+    const nowMs = Date.now();
+    const lastFirestoreWriteMs =
+      latestFirestoreWriteAtBySession.get(sessionId) || 0;
+    const shouldWriteFirestore =
+      nowMs - lastFirestoreWriteMs >= LATEST_FIRESTORE_WRITE_INTERVAL_MS;
+
+    if (!shouldWriteFirestore) {
+      return res.json({
+        success: true,
+        live: true,
+        firestoreSkipped: true,
+        hasMapPosition: !!latestMapPosition,
+      });
+    }
 
     const updateBody = {
       latestTelemetry,
@@ -5210,8 +5300,9 @@ app.post("/telemetry/latest", async (req, res) => {
     }
 
     await sessionRef.set(stripUndefinedDeep(updateBody), { merge: true });
+    latestFirestoreWriteAtBySession.set(sessionId, nowMs);
 
-    res.json({ success: true, hasMapPosition: !!latestMapPosition });
+    res.json({ success: true, live: true, hasMapPosition: !!latestMapPosition });
   } catch (err) {
     console.error("POST /telemetry/latest error:", err);
     res.status(500).json({ error: "failed to update latest telemetry" });
@@ -5247,9 +5338,12 @@ app.post("/telemetry/batch", async (req, res) => {
     const stats = buildMapStats(samples);
     const latestTelemetry = samples[samples.length - 1];
     const latestMapPosition = stats.latestMapPosition ?? buildLatestMapPosition(latestTelemetry);
+    const cachedLive = liveTelemetryCache.get(sessionId);
+    const currentLatestTelemetry =
+      cachedLive?.latestTelemetry ?? sessionData.latestTelemetry;
     const shouldUpdateLatest = isNewerTelemetrySample(
       latestTelemetry,
-      sessionData.latestTelemetry
+      currentLatestTelemetry
     );
     const acceptedLatestMapPosition = shouldUpdateLatest
       ? latestMapPosition
@@ -5287,9 +5381,18 @@ app.post("/telemetry/batch", async (req, res) => {
     };
 
     if (shouldUpdateLatest) {
+      const livePayload = buildLiveTelemetryPayload(
+        sessionId,
+        latestTelemetry,
+        latestMapPosition,
+        sessionData
+      );
+      broadcastLiveTelemetry(sessionId, livePayload);
+
       updateBody.latestTelemetry = latestTelemetry;
       updateBody.latestTelemetryFreshness = telemetryFreshness(latestTelemetry);
       updateBody.latestTelemetryAt = FieldValue.serverTimestamp();
+      latestFirestoreWriteAtBySession.set(sessionId, Date.now());
 
       if (latestMapPosition) {
         updateBody.latestMapPosition = latestMapPosition;
@@ -5404,6 +5507,73 @@ app.post("/sessions/:id/track-map/finalize", authenticate, requireAdmin, async (
   } catch (err) {
     console.error("POST /sessions/:id/track-map/finalize error:", err);
     res.status(500).json({ error: "failed to finalize track map" });
+  }
+});
+
+app.get("/sessions/:id/live-stream", authenticate, async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+
+    const sessionData = sessionSnap.data() || {};
+    if (!requireReadableSession(req, res, sessionData)) return;
+
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+    res.socket?.setTimeout?.(0);
+
+    const clients = getLiveClientSet(sessionId);
+    clients.add(res);
+
+    writeLiveStreamEvent(res, "ready", {
+      sessionId,
+      serverSentAt: new Date().toISOString(),
+    });
+
+    const cachedPayload = liveTelemetryCache.get(sessionId);
+    const initialPayload =
+      cachedPayload ||
+      buildLiveTelemetryPayload(
+        sessionId,
+        sessionData.latestTelemetry ?? null,
+        sessionData.latestMapPosition ?? sessionData.mapSummary?.latestMapPosition ?? null,
+        sessionData
+      );
+
+    if (initialPayload.latestTelemetry) {
+      writeLiveStreamEvent(res, "telemetry", initialPayload);
+    }
+
+    const heartbeat = setInterval(() => {
+      if (res.destroyed || res.writableEnded) return;
+      writeLiveStreamEvent(res, "ping", {
+        sessionId,
+        serverSentAt: new Date().toISOString(),
+      });
+    }, LIVE_STREAM_HEARTBEAT_MS);
+
+    res.on("close", () => {
+      clearInterval(heartbeat);
+      clients.delete(res);
+      if (clients.size === 0) {
+        liveStreamClients.delete(sessionId);
+      }
+    });
+  } catch (err) {
+    console.error("GET /sessions/:id/live-stream error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "failed to open live telemetry stream" });
+    } else {
+      res.end();
+    }
   }
 });
 
