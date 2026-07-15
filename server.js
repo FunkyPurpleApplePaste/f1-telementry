@@ -5245,22 +5245,51 @@ function lapPerfBuildTraces(samples, maxSamples) {
 function sessionPerfBuildTraces(samples, maxSamples) {
   const sorted = lapPerfSortSamples(samples);
   const sampled = downsampleReportSamples(sorted, maxSamples);
-  const firstTotalDistance =
-    sampled.find((sample) => finiteNumberOrNull(sample.totalDistance) !== null)?.totalDistance ?? null;
+  const totalDistances = sampled
+    .map((sample) => finiteNumberOrNull(sample.totalDistance))
+    .filter((value) => value !== null);
+  const firstTotalDistance = totalDistances[0] ?? null;
+  const totalDistanceSpan = totalDistances.length
+    ? Math.max(...totalDistances) - Math.min(...totalDistances)
+    : 0;
+  const canUseTotalDistance = firstTotalDistance !== null && totalDistanceSpan >= 5;
+  let cumulativeLapOffsetM = 0;
+  let previousLapNumber = null;
+  let previousLapDistance = null;
 
   return sampled.map((sample, index) => {
     const totalDistance = finiteNumberOrNull(sample.totalDistance);
     const lapDistance = finiteNumberOrNull(sample.lapDistance);
-    const distanceM =
-      totalDistance !== null && firstTotalDistance !== null
-        ? Math.max(0, totalDistance - firstTotalDistance)
+    const lapNumber = parseInteger(sample.lapNumber, null);
+
+    if (!canUseTotalDistance && lapDistance !== null) {
+      const lapChanged =
+        previousLapNumber !== null &&
+        lapNumber !== null &&
+        lapNumber > previousLapNumber;
+      const distanceReset =
+        previousLapDistance !== null &&
+        lapDistance + 20 < previousLapDistance;
+
+      if (lapChanged || distanceReset) {
+        cumulativeLapOffsetM += Math.max(previousLapDistance ?? 0, lapDistance, 0);
+      }
+
+      previousLapNumber = lapNumber ?? previousLapNumber;
+      previousLapDistance = lapDistance;
+    }
+
+    const distanceM = canUseTotalDistance
+      ? Math.max(0, totalDistance - firstTotalDistance)
+      : lapDistance !== null
+        ? Math.max(0, cumulativeLapOffsetM + Math.max(0, lapDistance))
         : index;
 
     return stripUndefinedDeep({
       index,
       sampleIndex: parseInteger(sample.sampleIndex, null),
       timestamp: sample.timestamp || null,
-      lapNumber: parseInteger(sample.lapNumber, null),
+      lapNumber,
       lapDistance: lapPerfRound(lapDistance, 2),
       totalDistance: lapPerfRound(totalDistance, 2),
       distanceM: lapPerfRound(distanceM, 2),
