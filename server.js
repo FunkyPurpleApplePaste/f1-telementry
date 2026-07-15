@@ -270,6 +270,84 @@ function finiteNumberOrNull(value) {
   return n === null ? null : n;
 }
 
+function telemetryTimestampMillis(value) {
+  if (!value) return null;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (typeof value.toDate === "function") return value.toDate().getTime();
+  if (typeof value.seconds === "number") {
+    const nanos = Number(value.nanoseconds || 0);
+    return value.seconds * 1000 + Math.floor(nanos / 1000000);
+  }
+
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function telemetryFreshness(sample) {
+  if (!sample || typeof sample !== "object") {
+    return {
+      sampleIndex: null,
+      gameTimeMs: null,
+      lapNumber: null,
+      lapDistance: null,
+      timestampMs: null,
+    };
+  }
+
+  return {
+    sampleIndex: parseInteger(sample.sampleIndex ?? sample.i, null),
+    gameTimeMs: finiteNumberOrNull(
+      sample.gameTimeMs ??
+        sample.gameTime ??
+        sample.sessionTimeMs ??
+        sample.sessionTime
+    ),
+    lapNumber: parseInteger(sample.lapNumber ?? sample.lap, null),
+    lapDistance: finiteNumberOrNull(sample.lapDistance ?? sample.d),
+    timestampMs: telemetryTimestampMillis(sample.timestamp ?? sample.t),
+  };
+}
+
+function compareTelemetryFreshness(candidate, current) {
+  const next = telemetryFreshness(candidate);
+  const prev = telemetryFreshness(current);
+
+  for (const key of ["sampleIndex", "gameTimeMs", "timestampMs"]) {
+    if (next[key] !== null && prev[key] !== null) {
+      const diff = next[key] - prev[key];
+      if (diff !== 0) return diff;
+    }
+  }
+
+  if (
+    next.lapNumber !== null &&
+    prev.lapNumber !== null &&
+    next.lapNumber !== prev.lapNumber
+  ) {
+    return next.lapNumber - prev.lapNumber;
+  }
+
+  if (
+    next.lapDistance !== null &&
+    prev.lapDistance !== null &&
+    next.lapDistance !== prev.lapDistance
+  ) {
+    return next.lapDistance - prev.lapDistance;
+  }
+
+  const nextHasSignal = Object.values(next).some((value) => value !== null);
+  const prevHasSignal = Object.values(prev).some((value) => value !== null);
+  if (nextHasSignal && !prevHasSignal) return 1;
+  if (!nextHasSignal && prevHasSignal) return -1;
+  return 0;
+}
+
+function isNewerTelemetrySample(candidate, current) {
+  if (!candidate) return false;
+  if (!current) return true;
+  return compareTelemetryFreshness(candidate, current) > 0;
+}
+
 const MAP_TELEPORT_JUMP_METERS = Number(process.env.MAP_TELEPORT_JUMP_METERS || 180);
 
 function mapPointDistanceMeters(a, b) {
@@ -1219,10 +1297,17 @@ async function applySessionSummary(sessionRef, patch, latestLap = null) {
   );
 
   const updateBody = {
-    latestTelemetry: patch.latestTelemetry ?? current.latestTelemetry ?? null,
-    latestTelemetryAt: FieldValue.serverTimestamp(),
     processedSummary: mergedSummary,
   };
+
+  if (
+    patch.latestTelemetry !== undefined &&
+    isNewerTelemetrySample(patch.latestTelemetry, current.latestTelemetry)
+  ) {
+    updateBody.latestTelemetry = patch.latestTelemetry;
+    updateBody.latestTelemetryFreshness = telemetryFreshness(patch.latestTelemetry);
+    updateBody.latestTelemetryAt = FieldValue.serverTimestamp();
+  }
 
   await sessionRef.set(stripUndefinedDeep(updateBody), { merge: true });
 }
@@ -5102,10 +5187,19 @@ app.post("/telemetry/latest", async (req, res) => {
       return res.json({ success: true, ignored: true, reason: "session ended" });
     }
 
+    if (!isNewerTelemetrySample(latestTelemetry, sessionData.latestTelemetry)) {
+      return res.json({
+        success: true,
+        ignored: true,
+        reason: "old or duplicate telemetry",
+      });
+    }
+
     const latestMapPosition = buildLatestMapPosition(latestTelemetry);
 
     const updateBody = {
       latestTelemetry,
+      latestTelemetryFreshness: telemetryFreshness(latestTelemetry),
       latestTelemetryAt: FieldValue.serverTimestamp(),
     };
 
@@ -5153,6 +5247,13 @@ app.post("/telemetry/batch", async (req, res) => {
     const stats = buildMapStats(samples);
     const latestTelemetry = samples[samples.length - 1];
     const latestMapPosition = stats.latestMapPosition ?? buildLatestMapPosition(latestTelemetry);
+    const shouldUpdateLatest = isNewerTelemetrySample(
+      latestTelemetry,
+      sessionData.latestTelemetry
+    );
+    const acceptedLatestMapPosition = shouldUpdateLatest
+      ? latestMapPosition
+      : sessionData.latestMapPosition ?? sessionData.mapSummary?.latestMapPosition ?? null;
 
     const chunkRef = sessionRef.collection("telemetryChunks").doc();
 
@@ -5176,27 +5277,34 @@ app.post("/telemetry/batch", async (req, res) => {
     const mergedMapSummary = mergeMapSummary(
       sessionData.mapSummary || {},
       stats,
-      latestMapPosition,
+      acceptedLatestMapPosition,
       sessionData
     );
 
-    await sessionRef.set(
-      stripUndefinedDeep({
-        latestTelemetry,
-        latestTelemetryAt: FieldValue.serverTimestamp(),
-        latestMapPosition: latestMapPosition ?? sessionData.latestMapPosition ?? null,
-        processedSummary: mergedSummary,
-        mapSummary: mergedMapSummary,
-      }),
-      { merge: true }
-    );
+    const updateBody = {
+      processedSummary: mergedSummary,
+      mapSummary: mergedMapSummary,
+    };
 
-    const trackKey = await mergeGlobalTrackMap(sessionData, stats, latestMapPosition);
+    if (shouldUpdateLatest) {
+      updateBody.latestTelemetry = latestTelemetry;
+      updateBody.latestTelemetryFreshness = telemetryFreshness(latestTelemetry);
+      updateBody.latestTelemetryAt = FieldValue.serverTimestamp();
+
+      if (latestMapPosition) {
+        updateBody.latestMapPosition = latestMapPosition;
+      }
+    }
+
+    await sessionRef.set(stripUndefinedDeep(updateBody), { merge: true });
+
+    const trackKey = await mergeGlobalTrackMap(sessionData, stats, acceptedLatestMapPosition);
 
     res.status(201).json({
       success: true,
       count: samples.length,
       mapPointCount: stats.mapPointCount,
+      latestAccepted: shouldUpdateLatest,
       trackKey,
       mapBounds: stats.bounds,
     });
