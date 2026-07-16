@@ -2663,7 +2663,7 @@ app.patch("/sessions/:id", async (req, res) => {
 });
 
 // POST_SESSION_AI_REPORT_START
-const POST_SESSION_REPORT_SCHEMA = "f1-coach-evidence-report-v4";
+const POST_SESSION_REPORT_SCHEMA = "f1-coach-evidence-report-v5";
 const LOW_MEMORY_REPORT_PATCH_APPLIED = true;
 const REPORT_TELEMETRY_CHUNK_PAGE_SIZE = Number(process.env.POST_SESSION_CHUNK_PAGE_SIZE || 2);
 const MAX_REPORT_SAMPLES_PER_LAP = Number(process.env.POST_SESSION_MAX_SAMPLES_PER_LAP || 120);
@@ -4047,9 +4047,11 @@ function buildLapComparisonTable(lapSummaries, bestLap, theoreticalBestLap = nul
     lapTime: lap.lapTime,
     gapToBestMs: bestLap && lap.lapTimeMs !== null ? lap.lapTimeMs - bestLap.lapTimeMs : null,
     gapToTheoreticalBestMs:
-      theoreticalBestLap?.lapTimeMs !== null && lap.lapTimeMs !== null
+      theoreticalBestLap?.lapTimeMs != null && lap.lapTimeMs !== null
         ? lap.lapTimeMs - theoreticalBestLap.lapTimeMs
         : null,
+    assists: lap.assists || null,
+    assistSummary: reportAssistSummaryLine(lap.assists),
     avgSpeedKph: lap.avgSpeedKph,
     maxSpeedKph: lap.maxSpeedKph,
     fullThrottlePct: lap.fullThrottlePct,
@@ -4249,8 +4251,236 @@ function buildPostSessionCoachSignals(lapSummaries, precisionFindings, bestLap) 
   return unique.slice(0, 18);
 }
 
+function reportYesNo(value) {
+  if (value === true) return "yes";
+  if (value === false) return "no";
+  return "-";
+}
+
+function reportBoolState(value) {
+  if (value === true) return "on";
+  if (value === false) return "off";
+  return "unknown";
+}
+
+function dynamicRacingLineLabel(value) {
+  if (value === null || value === undefined) return "Unknown";
+  return {
+    0: "Off",
+    1: "Corners Only",
+    2: "Full",
+  }[value] || "Mode " + value;
+}
+
+function reportUniqueStrings(values, limit = 6) {
+  const out = [];
+  const seen = new Set();
+
+  for (const value of values || []) {
+    const text = safeString(value, null);
+    if (!text || text.toLowerCase() === "unknown") continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(text);
+    if (out.length >= limit) break;
+  }
+
+  return out;
+}
+
+function reportAssistBoolSummary(profiles, key) {
+  const values = (profiles || [])
+    .map((profile) => parseBoolean(profile?.[key], null))
+    .filter((value) => value !== null);
+  if (!values.length) return "unknown";
+  const hasOn = values.some(Boolean);
+  const hasOff = values.some((value) => !value);
+  if (hasOn && hasOff) return "mixed";
+  return hasOn ? "on" : "off";
+}
+
+function reportAssistSummaryLine(assists) {
+  if (!assists) return "not recorded";
+
+  const parts = [
+    "TC " + (assists.tractionControlLabel || tractionControlLabel(assists.tractionControl)),
+    "ABS " + reportBoolState(assists.antiLockBrakesActive ?? assists.antiLockBrakes),
+    "Gearbox " + (assists.gearboxAssistLabel || gearboxAssistLabel(assists.gearboxAssist)),
+    "DRS assist " + reportBoolState(assists.drsAssistActive ?? assists.drsAssist),
+    "Racing line " + dynamicRacingLineLabel(assists.dynamicRacingLine),
+  ];
+
+  const optional = [
+    assists.brakingAssistActive === true ? "braking assist on" : null,
+    assists.steeringAssistActive === true ? "steering assist on" : null,
+    assists.ersAssistActive === true ? "ERS assist on" : null,
+  ].filter(Boolean);
+
+  return parts.concat(optional).join(", ");
+}
+
+function buildReportAssistSnapshot(assists) {
+  if (!assists) return null;
+  return stripUndefinedDeep({
+    summary: reportAssistSummaryLine(assists),
+    tractionControl: assists.tractionControl,
+    tractionControlLabel: assists.tractionControlLabel || tractionControlLabel(assists.tractionControl),
+    antiLockBrakes: assists.antiLockBrakesActive ?? assists.antiLockBrakes,
+    gearboxAssist: assists.gearboxAssist,
+    gearboxAssistLabel: assists.gearboxAssistLabel || gearboxAssistLabel(assists.gearboxAssist),
+    automaticGearbox: assists.automaticGearbox,
+    suggestedGear: assists.suggestedGear,
+    drsAssist: assists.drsAssistActive ?? assists.drsAssist,
+    steeringAssist: assists.steeringAssistActive ?? assists.steeringAssist,
+    brakingAssist: assists.brakingAssistActive ?? assists.brakingAssist,
+    pitAssist: assists.pitAssistActive ?? assists.pitAssist,
+    pitReleaseAssist: assists.pitReleaseAssistActive ?? assists.pitReleaseAssist,
+    ersAssist: assists.ersAssistActive ?? assists.ersAssist,
+    dynamicRacingLine: assists.dynamicRacingLine,
+    dynamicRacingLineLabel: dynamicRacingLineLabel(assists.dynamicRacingLine),
+  });
+}
+
+function buildReportAssistSummary(lapSummaries, samples) {
+  const lapProfiles = (lapSummaries || [])
+    .filter((lap) => lap.assists)
+    .map((lap) => ({
+      lapNumber: lap.lapNumber,
+      assists: lap.assists,
+    }));
+  const sampleProfiles = (samples || [])
+    .filter((sample) => sample.assists)
+    .map((sample) => ({ assists: sample.assists }));
+  const profiles = [...lapProfiles, ...sampleProfiles].map((item) => item.assists).filter(Boolean);
+
+  if (!profiles.length) {
+    return {
+      status: "not_recorded",
+      summaryLine: "Assist data was not recorded for this session.",
+      lapAssistCoverage: "0/" + (lapSummaries || []).length,
+      coachingUse:
+        "Do not assume assist settings. If giving braking, throttle, or gear advice, say assist context is unknown.",
+    };
+  }
+
+  const tractionControlModes = reportUniqueStrings(
+    profiles.map((profile) => profile.tractionControlLabel || tractionControlLabel(profile.tractionControl))
+  );
+  const gearboxModes = reportUniqueStrings(
+    profiles.map((profile) => profile.gearboxAssistLabel || gearboxAssistLabel(profile.gearboxAssist))
+  );
+  const racingLineModes = reportUniqueStrings(
+    profiles.map((profile) => dynamicRacingLineLabel(profile.dynamicRacingLine))
+  );
+  const antiLockBrakes = reportAssistBoolSummary(profiles, "antiLockBrakesActive");
+  const automaticGearbox = reportAssistBoolSummary(profiles, "automaticGearbox");
+  const suggestedGear = reportAssistBoolSummary(profiles, "suggestedGear");
+  const drsAssist = reportAssistBoolSummary(profiles, "drsAssistActive");
+  const steeringAssist = reportAssistBoolSummary(profiles, "steeringAssistActive");
+  const brakingAssist = reportAssistBoolSummary(profiles, "brakingAssistActive");
+  const ersAssist = reportAssistBoolSummary(profiles, "ersAssistActive");
+
+  const changedDuringSession = [
+    tractionControlModes.length > 1 ? "traction control" : null,
+    gearboxModes.length > 1 ? "gearbox" : null,
+    racingLineModes.length > 1 ? "racing line" : null,
+    antiLockBrakes === "mixed" ? "ABS" : null,
+    automaticGearbox === "mixed" ? "automatic gearbox" : null,
+    drsAssist === "mixed" ? "DRS assist" : null,
+    brakingAssist === "mixed" ? "braking assist" : null,
+    steeringAssist === "mixed" ? "steering assist" : null,
+  ].filter(Boolean);
+
+  const activeAssists = [
+    antiLockBrakes === "on" || antiLockBrakes === "mixed" ? "ABS" : null,
+    tractionControlModes.some((mode) => mode.toLowerCase() !== "off") ? "traction control" : null,
+    automaticGearbox === "on" || automaticGearbox === "mixed" ? "automatic gearbox" : null,
+    suggestedGear === "on" || suggestedGear === "mixed" ? "suggested gear" : null,
+    drsAssist === "on" || drsAssist === "mixed" ? "DRS assist" : null,
+    brakingAssist === "on" || brakingAssist === "mixed" ? "braking assist" : null,
+    steeringAssist === "on" || steeringAssist === "mixed" ? "steering assist" : null,
+    ersAssist === "on" || ersAssist === "mixed" ? "ERS assist" : null,
+  ].filter(Boolean);
+
+  const summaryLine =
+    "TC " + (tractionControlModes.length ? tractionControlModes.join("/") : "unknown") +
+    ", ABS " + antiLockBrakes +
+    ", gearbox " + (gearboxModes.length ? gearboxModes.join("/") : "unknown") +
+    ", DRS assist " + drsAssist +
+    ", racing line " + (racingLineModes.length ? racingLineModes.join("/") : "unknown");
+
+  return stripUndefinedDeep({
+    status: "recorded",
+    summaryLine,
+    lapAssistCoverage: lapProfiles.length + "/" + (lapSummaries || []).length,
+    activeAssists,
+    changedDuringSession,
+    tractionControlModes,
+    antiLockBrakes,
+    gearboxModes,
+    automaticGearbox,
+    suggestedGear,
+    drsAssist,
+    steeringAssist,
+    brakingAssist,
+    ersAssist,
+    racingLineModes,
+    lapSnapshots: lapProfiles.slice(0, MAX_REPORT_LAP_SUMMARIES).map((item) => ({
+      lapNumber: item.lapNumber,
+      ...buildReportAssistSnapshot(item.assists),
+    })),
+    coachingUse:
+      "Use assists as context for coaching. For example, ABS changes braking-lockup advice, traction control changes throttle-exit advice, automatic gearbox changes gear-choice advice, and DRS assist changes DRS-reaction advice.",
+  });
+}
+
+function buildPostSessionCoachBrief(report) {
+  const s = report.sessionSnapshot || {};
+  const topSignals = report.topCoachSignals || [];
+  const firstSignal = topSignals[0] || null;
+  const theoreticalGapMs = report.theoreticalBestLap?.bestActualGapToTheoreticalMs;
+  const setupText =
+    "custom setup " + reportYesNo(s.customSetup) +
+    ", equal performance " + reportYesNo(s.equalPerformance);
+
+  return stripUndefinedDeep({
+    primaryRead: firstSignal
+      ? firstSignal.area + " is the main detected focus from lap " + firstSignal.lap + " (" + firstSignal.severity + ")."
+      : "No strong automatic weakness detected; focus on consistency and repeatable references.",
+    dataConfidence: report.dataQuality?.confidence || "unknown",
+    paceOpportunity:
+      theoreticalGapMs != null
+        ? "Best actual lap is " + reportFormatNumber(theoreticalGapMs / 1000, 3, " sec") + " away from the theoretical best sector-combination lap."
+        : "Theoretical best comparison is unavailable or incomplete.",
+    bestActualLap: report.bestLap || null,
+    theoreticalBestLap: report.theoreticalBestLap
+      ? {
+          lapTime: report.theoreticalBestLap.lapTime,
+          gapMs: theoreticalGapMs,
+          sectorSources: report.theoreticalBestLap.sectors,
+          note: report.theoreticalBestLap.method,
+        }
+      : null,
+    setupContext: setupText,
+    assistContext: report.assistSummary?.summaryLine || "Assist data was not recorded.",
+    priorityEvidence: topSignals.slice(0, 3).map((signal, index) => ({
+      priority: index + 1,
+      area: signal.area,
+      severity: signal.severity,
+      lap: signal.lap,
+      evidence: signal.evidence,
+      coachingAngle: signal.coachingAngle,
+    })),
+    aiUse:
+      "Start with the priority evidence, then compare the relevant weak lap to the best actual lap and theoretical best. Mention assists/setup only where they affect the interpretation.",
+  });
+}
+
 function renderPostSessionMarkdown(report) {
   const s = report.sessionSnapshot;
+  const brief = report.coachBrief || {};
+  const assistSummary = report.assistSummary || {};
   const lines = [
     "# F1 25 Coach Evidence Report",
     "",
@@ -4264,9 +4494,29 @@ function renderPostSessionMarkdown(report) {
     "- For apex-corner evidence, brakeDistanceDeltaM > 0 means the driver braked earlier than the reference; exitDistanceDeltaM > 0 means they reached full throttle later.",
     "- Only make confident exit-speed claims when exitMeasurementConfidence is high.",
     "- Use theoretical best lap as the sector-combination pace ceiling, but do not treat it as a real driven lap.",
+    "- Use assist, custom setup, and equal performance data as context. Do not compare assisted and unassisted driving as if conditions are identical.",
+    "- If assist data is missing, say it is unknown instead of assuming assists were off.",
     "- If data quality is limited, lower confidence instead of overclaiming.",
     "",
-    "## 2. Data Quality",
+    "## 2. Coach Brief",
+    "",
+    "- Primary read: " + (brief.primaryRead || "-"),
+    "- Pace opportunity: " + (brief.paceOpportunity || "-"),
+    "- Assist context: " + (assistSummary.summaryLine || "Assist data was not recorded."),
+    "- Setup context: custom setup " + reportYesNo(s.customSetup) + ", equal performance " + reportYesNo(s.equalPerformance),
+    "- Active assists detected: " + (assistSummary.activeAssists?.length ? assistSummary.activeAssists.join(", ") : "none recorded"),
+    "- Assist changes during session: " + (assistSummary.changedDuringSession?.length ? assistSummary.changedDuringSession.join(", ") : "none recorded"),
+    "- Data confidence: " + (brief.dataConfidence || report.dataQuality.confidence),
+    "",
+    "Priority evidence:",
+    ...(brief.priorityEvidence?.length
+      ? brief.priorityEvidence.flatMap((item) => [
+          "- P" + item.priority + " " + item.area + " (" + item.severity + ", lap " + item.lap + "): " + item.evidence,
+          "  Coach angle: " + item.coachingAngle,
+        ])
+      : ["- No priority evidence generated."]),
+    "",
+    "## 3. Data Quality",
     "",
     "- Confidence: " + report.dataQuality.confidence,
     "- Samples recorded: " + report.dataQuality.sampleCount,
@@ -4279,18 +4529,20 @@ function renderPostSessionMarkdown(report) {
     "- World position available: " + (report.dataQuality.worldPositionAvailable ? "yes" : "no"),
     "- Limitations: " + (report.dataQuality.limitations.length ? report.dataQuality.limitations.join("; ") : "none detected"),
     "",
-    "## 3. Session Context",
+    "## 4. Session Context",
     "",
     "- Session ID: " + s.sessionId,
     "- Driver: " + (s.username || "-"),
     "- Track: " + (s.trackName || "-"),
     "- Session type: " + (s.sessionType ?? "-"),
-    "- Custom setup: " + (s.customSetup === true ? "yes" : s.customSetup === false ? "no" : "-"),
-    "- Equal performance: " + (s.equalPerformance === true ? "yes" : s.equalPerformance === false ? "no" : "-"),
+    "- Custom setup: " + reportYesNo(s.customSetup),
+    "- Equal performance: " + reportYesNo(s.equalPerformance),
+    "- Assists: " + (assistSummary.summaryLine || "not recorded"),
+    "- Assist lap coverage: " + (assistSummary.lapAssistCoverage || "-"),
     "- Started: " + (s.startedAt || "-"),
     "- Ended: " + (s.endedAt || "-"),
     "",
-    "## 4. Session Summary",
+    "## 5. Session Summary",
     "",
     "- Best actual lap: " + (report.bestLap?.lapTime || "-") + (report.bestLap ? " on lap " + report.bestLap.lapNumber : ""),
     "- Theoretical best lap: " + (report.theoreticalBestLap?.lapTime || "-") + (report.theoreticalBestLap?.isComplete ? " (best valid sectors combined)" : " (sector data incomplete)"),
@@ -4302,10 +4554,10 @@ function renderPostSessionMarkdown(report) {
     "- Average speed: " + reportFormatNumber(s.avgSpeedKph, 1, " kph"),
     "- Main automatic focus: " + (report.precisionFindings[0]?.interpretation || "no strong weakness detected"),
     "",
-    "## 5. Lap Comparison",
+    "## 6. Lap Comparison",
     "",
-    "| Lap | Time | Gap To Best Actual | Gap To Theoretical | Avg Speed | Top Speed | Full Throttle | Heavy Brake | Coasting | Pedal Overlap |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| Lap | Time | Gap To Best Actual | Gap To Theoretical | Avg Speed | Top Speed | Full Throttle | Heavy Brake | Coasting | Pedal Overlap | Assists |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
   ];
 
   for (const row of report.lapComparisonTable) {
@@ -4322,12 +4574,13 @@ function renderPostSessionMarkdown(report) {
           reportFormatPct(row.heavyBrakePct),
           reportFormatPct(row.coastingPct),
           reportFormatPct(row.throttleBrakeOverlapPct),
+          row.assistSummary || "-",
         ].join(" | ") +
         " |"
     );
   }
 
-  lines.push("", "## 6. Top Coach Signals", "");
+  lines.push("", "## 7. Top Coach Signals", "");
 
   if (!report.topCoachSignals.length) {
     lines.push("No major automatic warning signals were detected. Focus on lap-to-lap consistency and racing line.");
@@ -4346,7 +4599,7 @@ function renderPostSessionMarkdown(report) {
   }
 
   lines.push(
-    "## 7. Precision Braking Findings",
+    "## 8. Precision Braking Findings",
     "",
     "| Lap | Zone | Location | Severity | Evidence | Coaching Tip |",
     "| --- | --- | --- | --- | --- | --- |"
@@ -4369,7 +4622,7 @@ function renderPostSessionMarkdown(report) {
 
   lines.push(
     "",
-    "## 8. Precision Corner Findings",
+    "## 9. Precision Corner Findings",
     "",
     "| Lap | Zone | Location | Severity | Evidence | Coaching Tip |",
     "| --- | --- | --- | --- | --- | --- |"
@@ -4390,7 +4643,7 @@ function renderPostSessionMarkdown(report) {
     );
   }
 
-  lines.push("", "## 9. Lap Details", "");
+  lines.push("", "## 10. Lap Details", "");
 
   for (const lap of report.lapSummaries) {
     lines.push(
@@ -4400,6 +4653,7 @@ function renderPostSessionMarkdown(report) {
       "- Sector 1: " + reportFormatMs(lap.sector1Ms),
       "- Sector 2: " + reportFormatMs(lap.sector2Ms),
       "- Sector 3: " + reportFormatMs(lap.sector3Ms),
+      "- Assists: " + reportAssistSummaryLine(lap.assists),
       "- Full throttle: " + reportFormatPct(lap.fullThrottlePct),
       "- Heavy brake: " + reportFormatPct(lap.heavyBrakePct),
       "- Coasting: " + reportFormatPct(lap.coastingPct),
@@ -4472,7 +4726,7 @@ function renderPostSessionMarkdown(report) {
   }
 
   lines.push(
-    "## 10. Requested AI Output",
+    "## 11. Requested AI Output",
     "",
     "1. Session overview in 3 short bullets.",
     "2. Top 3 coaching tips, each with braking/corner evidence.",
@@ -4543,6 +4797,7 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
   const precisionFindings = buildPrecisionFindings(lapSummaries, bestLap);
   const topCoachSignals = buildPostSessionCoachSignals(lapSummaries, precisionFindings, bestLap);
   const lapComparisonTable = buildLapComparisonTable(lapSummaries, bestLap, theoreticalBestLap);
+  const assistSummary = buildReportAssistSummary(lapSummaries, samples);
   const status = samples.length || lapDocs.length ? "ready" : "empty";
 
   const report = stripUndefinedDeep({
@@ -4592,12 +4847,14 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
     theoreticalBestLap,
     apexCornerAnalysisSummary,
     apexCornerReference,
+    assistSummary,
     lapComparisonTable,
     lapSummaries,
     precisionFindings,
     topCoachSignals,
   });
 
+  report.coachBrief = buildPostSessionCoachBrief(report);
   report.aiReadableMarkdown = limitReportText(
     renderPostSessionMarkdown({
       ...report,
@@ -4672,6 +4929,8 @@ function compactLapForMainReport(lap) {
     sector2Ms: lap.sector2Ms,
     sector3Ms: lap.sector3Ms,
     valid: lap.valid,
+    assists: lap.assists || null,
+    assistSummary: reportAssistSummaryLine(lap.assists),
     avgSpeedKph: lap.avgSpeedKph,
     maxSpeedKph: lap.maxSpeedKph,
     fullThrottlePct: lap.fullThrottlePct,
