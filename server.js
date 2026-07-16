@@ -140,6 +140,137 @@ function parseBoolean(value, fallback = null) {
   return fallback;
 }
 
+function assistSource(raw) {
+  return raw?.assists && typeof raw.assists === "object" ? raw.assists : raw || {};
+}
+
+function readAssistValue(raw, keys) {
+  const source = assistSource(raw);
+  for (const key of keys) {
+    if (source[key] !== undefined && source[key] !== null && source[key] !== "") {
+      return source[key];
+    }
+    if (raw && raw[key] !== undefined && raw[key] !== null && raw[key] !== "") {
+      return raw[key];
+    }
+  }
+  return null;
+}
+
+function tractionControlLabel(value) {
+  if (value === null || value === undefined) return "Unknown";
+  return {
+    0: "Off",
+    1: "Medium",
+    2: "Full",
+  }[value] || `Level ${value}`;
+}
+
+function gearboxAssistLabel(value) {
+  if (value === null || value === undefined) return "Unknown";
+  return {
+    0: "Manual",
+    1: "Manual",
+    2: "Suggested",
+    3: "Automatic",
+  }[value] || `Mode ${value}`;
+}
+
+function normalizeAssistProfile(raw) {
+  const tractionControl = parseInteger(readAssistValue(raw, [
+    "tractionControl",
+    "tractionControlLevel",
+    "tc",
+  ]), null);
+  const antiLockBrakes = parseBoolean(readAssistValue(raw, [
+    "antiLockBrakes",
+    "antiLockBrakesActive",
+    "abs",
+  ]), null);
+  const gearboxAssist = parseInteger(readAssistValue(raw, [
+    "gearboxAssist",
+    "gearbox",
+    "gearboxMode",
+  ]), null);
+  const automaticGearbox =
+    parseBoolean(readAssistValue(raw, ["automaticGearbox", "autoGearbox"]), null) ??
+    (gearboxAssist !== null ? gearboxAssist >= 3 : null);
+  const suggestedGear =
+    parseBoolean(readAssistValue(raw, ["suggestedGear", "suggestedGearAssist"]), null) ??
+    (gearboxAssist !== null ? gearboxAssist === 2 : null);
+  const drsAssist = parseBoolean(readAssistValue(raw, [
+    "drsAssist",
+    "drsAssistActive",
+  ]), null);
+  const steeringAssist = parseBoolean(readAssistValue(raw, [
+    "steeringAssist",
+    "steeringAssistActive",
+  ]), null);
+  const brakingAssist = parseBoolean(readAssistValue(raw, [
+    "brakingAssist",
+    "brakingAssistActive",
+  ]), null);
+  const pitAssist = parseBoolean(readAssistValue(raw, [
+    "pitAssist",
+    "pitAssistActive",
+  ]), null);
+  const pitReleaseAssist = parseBoolean(readAssistValue(raw, [
+    "pitReleaseAssist",
+    "pitReleaseAssistActive",
+  ]), null);
+  const ersAssist = parseBoolean(readAssistValue(raw, [
+    "ersAssist",
+    "ersAssistActive",
+  ]), null);
+  const dynamicRacingLine = parseInteger(readAssistValue(raw, [
+    "dynamicRacingLine",
+    "racingLine",
+  ]), null);
+
+  const hasAnyValue = [
+    tractionControl,
+    antiLockBrakes,
+    gearboxAssist,
+    automaticGearbox,
+    suggestedGear,
+    drsAssist,
+    steeringAssist,
+    brakingAssist,
+    pitAssist,
+    pitReleaseAssist,
+    ersAssist,
+    dynamicRacingLine,
+  ].some((value) => value !== null && value !== undefined);
+
+  if (!hasAnyValue) return null;
+
+  return stripUndefinedDeep({
+    tractionControl,
+    tractionControlLabel: tractionControlLabel(tractionControl),
+    tractionControlActive: tractionControl !== null ? tractionControl > 0 : null,
+    antiLockBrakes,
+    antiLockBrakesActive: antiLockBrakes,
+    gearboxAssist,
+    gearboxAssistLabel: gearboxAssistLabel(gearboxAssist),
+    automaticGearbox,
+    suggestedGear,
+    drsAssist,
+    drsAssistActive: drsAssist,
+    steeringAssist,
+    steeringAssistActive: steeringAssist,
+    brakingAssist,
+    brakingAssistActive: brakingAssist,
+    pitAssist,
+    pitAssistActive: pitAssist,
+    pitReleaseAssist,
+    pitReleaseAssistActive: pitReleaseAssist,
+    ersAssist,
+    ersAssistActive: ersAssist,
+    dynamicRacingLine,
+    dynamicRacingLineActive: dynamicRacingLine !== null ? dynamicRacingLine > 0 : null,
+  });
+}
+
 function parseClientEndDate(value) {
   const raw = safeString(value, null);
   if (!raw) return null;
@@ -161,9 +292,11 @@ function buildEndMetadata(req, fallbackSource = "server_received") {
     parseClientEndDate(req.body?.endedAt) ||
     parseClientEndDate(req.body?.endDetectedAt) ||
     parseClientEndDate(req.body?.endedAtIso);
+  const effectiveEndedAt = endedAt || new Date();
 
   return stripUndefinedDeep({
-    endedAt,
+    endedAt: effectiveEndedAt,
+    endedAtIso: effectiveEndedAt.toISOString(),
     endedAtSource:
       safeString(req.body?.endedAtSource, null) ||
       safeString(req.body?.endSource, null) ||
@@ -359,9 +492,11 @@ function leaderboardEntryActivityMs(entry) {
 function leaderboardSessionActivityMs(sessionData) {
   return maxLeaderboardTimestampMs(
     sessionData?.endedAt,
+    sessionData?.endedAtIso,
     sessionData?.latestTelemetryAt,
     sessionData?.updatedAt,
     sessionData?.startedAt,
+    sessionData?.startedAtIso,
     sessionData?.createdAt
   );
 }
@@ -402,15 +537,19 @@ function buildLeaderboardEntry(sessionDoc, sessionData, lapDoc, lapData) {
   );
   const sortStartedAtMs = leaderboardTimestampMs(sessionData.startedAt);
   const sortEndedAtMs = leaderboardTimestampMs(sessionData.endedAt);
+  const sortStartedAtIsoMs = leaderboardTimestampMs(sessionData.startedAtIso);
+  const sortEndedAtIsoMs = leaderboardTimestampMs(sessionData.endedAtIso);
   const sortLatestTelemetryAtMs = leaderboardTimestampMs(sessionData.latestTelemetryAt);
   const sortUpdatedAtMs = leaderboardTimestampMs(sessionData.updatedAt);
   const sortCreatedAtMs = leaderboardTimestampMs(sessionData.createdAt);
   const sortActivityMs = Math.max(
     sortRecordedAtMs,
     sortEndedAtMs,
+    sortEndedAtIsoMs,
     sortLatestTelemetryAtMs,
     sortUpdatedAtMs,
     sortStartedAtMs,
+    sortStartedAtIsoMs,
     sortCreatedAtMs
   );
 
@@ -427,12 +566,13 @@ function buildLeaderboardEntry(sessionDoc, sessionData, lapDoc, lapData) {
     sector2Ms: parseInteger(lapData.sector2Ms, null),
     sector3Ms: parseInteger(lapData.sector3Ms, null),
     valid: lapData.valid === true,
+    assists: normalizeAssistProfile(lapData),
     trackName,
     trackId,
     trackKey,
     sessionType: parseInteger(sessionData.sessionType, null),
-    sessionStartedAt: sessionData.startedAt || null,
-    sessionEndedAt: sessionData.endedAt || null,
+    sessionStartedAt: sessionData.startedAt || sessionData.startedAtIso || null,
+    sessionEndedAt: sessionData.endedAt || sessionData.endedAtIso || null,
     sessionLatestTelemetryAt: sessionData.latestTelemetryAt || null,
     sessionUpdatedAt: sessionData.updatedAt || null,
     sessionCreatedAt: sessionData.createdAt || null,
@@ -904,7 +1044,7 @@ function hasEndedAt(value) {
 }
 
 function isClosedSession(session) {
-  return Boolean(session) && hasEndedAt(session.endedAt);
+  return Boolean(session) && (hasEndedAt(session.endedAt) || hasEndedAt(session.endedAtIso));
 }
 
 function authTokenHash(token) {
@@ -2429,7 +2569,10 @@ app.post("/sessions", async (req, res) => {
     const trackName = safeString(req.body.trackName, null);
     const trackId = parseInteger(req.body.trackId, null);
     const sessionType = parseInteger(req.body.sessionType, null);
+    const customSetup = parseBoolean(req.body.customSetup, null);
+    const equalPerformance = parseBoolean(req.body.equalPerformance, null);
     const trackKey = trackKeyFrom(trackId, trackName);
+    const startedAtIso = new Date().toISOString();
 
     const sessionRef = db.collection("sessions").doc();
     await sessionRef.set(stripUndefinedDeep({
@@ -2440,8 +2583,14 @@ app.post("/sessions", async (req, res) => {
       trackId,
       trackKey,
       sessionType,
+      customSetup,
+      equalPerformance,
       startedAt: FieldValue.serverTimestamp(),
+      startedAtIso,
+      createdAt: FieldValue.serverTimestamp(),
+      createdAtIso: startedAtIso,
       endedAt: null,
+      endedAtIso: null,
       latestTelemetry: null,
       latestTelemetryAt: null,
       latestMapPosition: null,
@@ -2494,6 +2643,10 @@ app.patch("/sessions/:id", async (req, res) => {
       updateBody.sessionType = parseInteger(req.body.sessionType, null);
     if (req.body.playerName !== undefined)
       updateBody.playerName = safeString(req.body.playerName, null);
+    if (req.body.customSetup !== undefined)
+      updateBody.customSetup = parseBoolean(req.body.customSetup, null);
+    if (req.body.equalPerformance !== undefined)
+      updateBody.equalPerformance = parseBoolean(req.body.equalPerformance, null);
 
     const nextTrackId = updateBody.trackId ?? current.trackId ?? null;
     const nextTrackName = updateBody.trackName ?? current.trackName ?? null;
@@ -2683,6 +2836,7 @@ function normalizeReportSample(raw, fallbackIndex) {
         raw?.drsDelayDistanceM ??
         raw?.drsReactionDistanceM
     ),
+    assists: normalizeAssistProfile(raw),
     currentSector: parseInteger(raw?.currentSector, null),
   };
 }
@@ -3743,6 +3897,7 @@ function summarizeReportLap(lapNumber, rawSamples, lapDoc, corners) {
     sector2Ms: parseInteger(lapDoc?.sector2Ms, null),
     sector3Ms: parseInteger(lapDoc?.sector3Ms, null),
     valid: lapDoc?.valid !== false,
+    assists: normalizeAssistProfile(lapDoc) || normalizeAssistProfile(samples.find((sample) => sample.assists)),
     approxDurationSec: reportRound(reportDurationSec(samples), 2),
     distanceCoveredM: reportRound(reportDistanceSpan(samples), 1),
     avgSpeedKph: reportRound(reportAvg(speeds), 1),
@@ -4130,6 +4285,8 @@ function renderPostSessionMarkdown(report) {
     "- Driver: " + (s.username || "-"),
     "- Track: " + (s.trackName || "-"),
     "- Session type: " + (s.sessionType ?? "-"),
+    "- Custom setup: " + (s.customSetup === true ? "yes" : s.customSetup === false ? "no" : "-"),
+    "- Equal performance: " + (s.equalPerformance === true ? "yes" : s.equalPerformance === false ? "no" : "-"),
     "- Started: " + (s.startedAt || "-"),
     "- Ended: " + (s.endedAt || "-"),
     "",
@@ -4403,8 +4560,10 @@ function buildPostSessionReportDocument(sessionId, sessionData, samples, lapDocs
       trackId: parseInteger(sessionData.trackId, null),
       trackName: safeString(sessionData.trackName, null),
       sessionType: parseInteger(sessionData.sessionType, null),
-      startedAt: reportIso(sessionData.startedAt),
-      endedAt: reportIso(sessionData.endedAt),
+      customSetup: parseBoolean(sessionData.customSetup, null),
+      equalPerformance: parseBoolean(sessionData.equalPerformance, null),
+      startedAt: reportIso(sessionData.startedAt || sessionData.startedAtIso),
+      endedAt: reportIso(sessionData.endedAt || sessionData.endedAtIso),
       reportPhase,
       reportTrigger,
       triggerLapNumber,
@@ -4786,7 +4945,7 @@ app.post("/sessions/:id/end", async (req, res) => {
     const sessionData = sessionSnap.data() || {};
     const endMetadata = buildEndMetadata(req);
     const requestedEndedAt = endMetadata.endedAt || null;
-    const currentEndedAt = asDate(sessionData.endedAt);
+    const currentEndedAt = asDate(sessionData.endedAt || sessionData.endedAtIso);
     const rebuildReport =
       parseBoolean(req.query.rebuildReport, false) ||
       parseBoolean(req.body?.rebuildReport, false);
@@ -4800,8 +4959,11 @@ app.post("/sessions/:id/end", async (req, res) => {
       await sessionRef.set(
         stripUndefinedDeep({
           endedAt: requestedEndedAt,
+          endedAtIso: endMetadata.endedAtIso,
           endedAtCorrectedAt: FieldValue.serverTimestamp(),
+          endedAtCorrectedAtIso: new Date().toISOString(),
           endedAtServerReceivedAt: FieldValue.serverTimestamp(),
+          endedAtServerReceivedAtIso: new Date().toISOString(),
           endedAtSource: endMetadata.endedAtSource,
           endReason: endMetadata.endReason,
           endPacketType: endMetadata.endPacketType,
@@ -4855,7 +5017,9 @@ app.post("/sessions/:id/end", async (req, res) => {
     await sessionRef.set(
       stripUndefinedDeep({
         endedAt: requestedEndedAt || FieldValue.serverTimestamp(),
+        endedAtIso: endMetadata.endedAtIso,
         endedAtServerReceivedAt: FieldValue.serverTimestamp(),
+        endedAtServerReceivedAtIso: new Date().toISOString(),
         endedAtSource: endMetadata.endedAtSource,
         endReason: endMetadata.endReason,
         endPacketType: endMetadata.endPacketType,
@@ -4954,6 +5118,7 @@ app.post("/sessions/:id/laps", async (req, res) => {
     const valid = parseBoolean(req.body.valid, false);
     const trackName = safeString(req.body.trackName, null);
     const trackId = parseInteger(req.body.trackId, null);
+    const assists = normalizeAssistProfile(req.body);
 
     if (!sessionId || lapNumber === null) {
       return res.status(400).json({ error: "sessionId and lapNumber required" });
@@ -4989,6 +5154,7 @@ app.post("/sessions/:id/laps", async (req, res) => {
       sector2Ms,
       sector3Ms: effectiveSector3Ms,
       valid,
+      assists,
       trackName,
       trackId,
       recordedAt: FieldValue.serverTimestamp(),
@@ -5370,6 +5536,7 @@ function sessionPerfNormalizeLap(lapData, bestLapTimeMs = null) {
     sector2Time: formatLapTime(sector2Ms),
     sector3Time: formatLapTime(sector3Ms),
     valid: lapData.valid === true,
+    assists: normalizeAssistProfile(lapData),
     recordedAt: lapData.recordedAt || null,
     gapToBestMs:
       bestLapTimeMs !== null && lapTimeMs !== null
@@ -5532,8 +5699,10 @@ app.get("/sessions/:id/performance", authenticate, async (req, res) => {
         trackId: parseInteger(sessionData.trackId, null),
         trackKey,
         sessionType: parseInteger(sessionData.sessionType, null),
-        startedAt: sessionData.startedAt || null,
-        endedAt: sessionData.endedAt || null,
+        customSetup: parseBoolean(sessionData.customSetup, null),
+        equalPerformance: parseBoolean(sessionData.equalPerformance, null),
+        startedAt: sessionData.startedAt || sessionData.startedAtIso || null,
+        endedAt: sessionData.endedAt || sessionData.endedAtIso || null,
         latestTelemetryAt: sessionData.latestTelemetryAt || null,
         postSessionReportStatus: safeString(sessionData.postSessionReportStatus, null),
         postSessionReportSummary: sessionData.postSessionReportSummary || null,
@@ -5673,8 +5842,10 @@ app.get("/sessions/:id/laps/:lapId/performance", optionalAuthenticate, async (re
         trackId: parseInteger(sessionData.trackId, null),
         trackKey,
         sessionType: parseInteger(sessionData.sessionType, null),
-        startedAt: sessionData.startedAt || null,
-        endedAt: sessionData.endedAt || null,
+        customSetup: parseBoolean(sessionData.customSetup, null),
+        equalPerformance: parseBoolean(sessionData.equalPerformance, null),
+        startedAt: sessionData.startedAt || sessionData.startedAtIso || null,
+        endedAt: sessionData.endedAt || sessionData.endedAtIso || null,
       },
       lap: {
         id: lapSnap.id,
@@ -5685,6 +5856,7 @@ app.get("/sessions/:id/laps/:lapId/performance", optionalAuthenticate, async (re
         sector2Ms: parseInteger(lapData.sector2Ms, null),
         sector3Ms: parseInteger(lapData.sector3Ms, null),
         valid: lapData.valid === true,
+        assists: normalizeAssistProfile(lapData),
         recordedAt: lapData.recordedAt || null,
       },
       personalBest,
