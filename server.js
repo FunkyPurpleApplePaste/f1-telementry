@@ -4977,6 +4977,9 @@ app.post("/sessions/:id/end", async (req, res) => {
       const reportRef = sessionRef.collection("reports").doc("postSession");
       const reportSnap = await reportRef.get();
       const existingReport = reportSnap.exists ? serializeDoc(reportSnap) : null;
+      const aiCoachResponse = existingReport
+        ? queueAiCoachResponseBuild(sessionRef, { trigger: "already_ended" })
+        : null;
 
       return res.json({
         ...serializeDoc(sessionSnap),
@@ -5006,6 +5009,7 @@ app.post("/sessions/:id/end", async (req, res) => {
               alreadyEnded: true,
               message: "Session was already ended; report was not rebuilt.",
             },
+        aiCoachResponse,
       });
     }
 
@@ -5073,10 +5077,16 @@ app.post("/sessions/:id/end", async (req, res) => {
       );
     }
 
+    const aiCoachResponse =
+      postSessionReport?.status === "ready"
+        ? queueAiCoachResponseBuild(sessionRef, { trigger: "session_end" })
+        : null;
+
     const updated = await sessionRef.get();
     res.json({
       ...serializeDoc(updated),
       postSessionReport,
+      aiCoachResponse,
     });
   } catch (err) {
     console.error("POST /sessions/:id/end error:", err);
@@ -5169,7 +5179,28 @@ app.post("/sessions/:id/reports/ai-coach-response", async (req, res) => {
 });
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
-const OPENROUTER_BEGINNER_MODEL = process.env.OPENROUTER_BEGINNER_MODEL || "anthropic/claude-opus-4.8";
+const OPENROUTER_COACH_MODEL =
+  process.env.OPENROUTER_COACH_MODEL ||
+  process.env.OPENROUTER_MODEL ||
+  "google/gemini-2.5-flash";
+const OPENROUTER_BEGINNER_MODEL =
+  process.env.OPENROUTER_BEGINNER_MODEL || OPENROUTER_COACH_MODEL;
+const OPENROUTER_MAX_TOKENS = Number(process.env.OPENROUTER_MAX_TOKENS || 1600);
+const OPENROUTER_APP_REFERER =
+  process.env.OPENROUTER_APP_REFERER ||
+  process.env.PUBLIC_APP_URL ||
+  "https://f1-telementry-1.onrender.com";
+
+const ADVANCED_AI_COACH_SYSTEM_PROMPT =
+  "You are an expert F1 driving coach analyzing post-session telemetry data from the F1 25 video game. " +
+  "Use only the evidence in the supplied report. Do not invent laps, sectors, speeds, distances, assists, or confidence levels. " +
+  "Respond with:\n" +
+  "1. Session overview in 3 short bullets.\n" +
+  "2. Top 3 coaching tips, each backed by exact telemetry evidence from the report.\n" +
+  "3. One lap-specific comparison to the best actual lap and the theoretical best lap if available.\n" +
+  "4. One braking drill.\n" +
+  "5. One corner-exit drill.\n" +
+  "6. A confidence rating based on the report data quality.";
 
 const BEGINNER_SYSTEM_PROMPT =
   "You are a friendly F1 driving coach explaining session analysis to a beginner. " +
@@ -5181,6 +5212,248 @@ const BEGINNER_SYSTEM_PROMPT =
   "- Use an encouraging, supportive tone.\n" +
   "- Do not add new analysis — only simplify what is already in the report.\n" +
   "- If assists are mentioned, explain simply what they do and whether the driver should consider changing them.";
+
+const aiCoachResponseJobs = new Map();
+
+function readAiCoachSourceContent(report) {
+  if (!report || typeof report !== "object") return null;
+  return (
+    safeString(report.aiReadableMarkdown, null) ||
+    safeString(report.coachBrief?.summary, null) ||
+    safeString(report.summaryMarkdown, null) ||
+    safeString(report.markdown, null) ||
+    null
+  );
+}
+
+async function callOpenRouterChat({ systemPrompt, userContent, model }) {
+  if (!OPENROUTER_API_KEY) {
+    const err = new Error("OPENROUTER_API_KEY missing");
+    err.status = 503;
+    throw err;
+  }
+
+  const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": OPENROUTER_APP_REFERER,
+      "X-Title": "F1 25 Telemetry Platform",
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: OPENROUTER_MAX_TOKENS,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+    }),
+  });
+
+  if (!openRouterRes.ok) {
+    const errText = await openRouterRes.text().catch(() => "");
+    const err = new Error(
+      `OpenRouter returned HTTP ${openRouterRes.status}: ${errText.slice(0, 300)}`
+    );
+    err.status = 502;
+    throw err;
+  }
+
+  const aiData = await openRouterRes.json();
+  const content = safeString(aiData?.choices?.[0]?.message?.content, null);
+
+  if (!content) {
+    const err = new Error("AI service returned an empty response");
+    err.status = 502;
+    throw err;
+  }
+
+  return content;
+}
+
+async function markAiCoachStatus(sessionRef, reportRef, status, fields = {}) {
+  const payload = stripUndefinedDeep({
+    aiCoachResponseStatus: status,
+    aiCoachResponseUpdatedAt: FieldValue.serverTimestamp(),
+    ...fields,
+  });
+
+  await Promise.all([
+    sessionRef.set(payload, { merge: true }),
+    reportRef ? reportRef.set(payload, { merge: true }) : Promise.resolve(),
+  ]);
+}
+
+async function generateAiCoachResponseForSession(sessionRef, options = {}) {
+  const force = parseBoolean(options.force, false);
+  const trigger = safeString(options.trigger, "manual");
+  const reportRef = sessionRef.collection("reports").doc("postSession");
+
+  try {
+    const sessionSnap = await sessionRef.get();
+    if (!sessionSnap.exists) {
+      return { status: "failed", error: "session not found" };
+    }
+
+    const reportSnap = await reportRef.get();
+    if (!reportSnap.exists) {
+      await markAiCoachStatus(sessionRef, reportRef, "failed", {
+        aiCoachResponseError: "post-session report not found",
+        aiCoachResponseTrigger: trigger,
+      });
+      return { status: "failed", error: "post-session report not found" };
+    }
+
+    const report = reportSnap.data() || {};
+    if (report.aiCoachResponse && !force) {
+      await sessionRef.set(
+        {
+          aiCoachResponseStatus: "ready",
+          aiCoachResponseModel: report.aiCoachModel || OPENROUTER_COACH_MODEL,
+          aiCoachResponseUpdatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      return {
+        status: "ready",
+        cached: true,
+        model: report.aiCoachModel || OPENROUTER_COACH_MODEL,
+      };
+    }
+
+    if (!OPENROUTER_API_KEY) {
+      await markAiCoachStatus(sessionRef, reportRef, "skipped", {
+        aiCoachResponseError: "OPENROUTER_API_KEY missing on backend",
+        aiCoachResponseTrigger: trigger,
+      });
+      return { status: "skipped", error: "OPENROUTER_API_KEY missing on backend" };
+    }
+
+    const sourceContent = readAiCoachSourceContent(report);
+    if (!sourceContent) {
+      await markAiCoachStatus(sessionRef, reportRef, "failed", {
+        aiCoachResponseError: "post-session report has no AI-readable content",
+        aiCoachResponseTrigger: trigger,
+      });
+      return { status: "failed", error: "post-session report has no AI-readable content" };
+    }
+
+    await markAiCoachStatus(sessionRef, reportRef, "processing", {
+      aiCoachResponseModel: OPENROUTER_COACH_MODEL,
+      aiCoachResponseTrigger: trigger,
+      aiCoachResponseStartedAt: FieldValue.serverTimestamp(),
+      aiCoachResponseError: FieldValue.delete(),
+    });
+
+    const responseMarkdown = await callOpenRouterChat({
+      systemPrompt: ADVANCED_AI_COACH_SYSTEM_PROMPT,
+      userContent: sourceContent,
+      model: OPENROUTER_COACH_MODEL,
+    });
+
+    await reportRef.set(
+      {
+        aiCoachResponse: responseMarkdown,
+        aiCoachModel: OPENROUTER_COACH_MODEL,
+        aiCoachGeneratedAt: new Date().toISOString(),
+        aiCoachReceivedAt: FieldValue.serverTimestamp(),
+        aiCoachResponseStatus: "ready",
+        aiCoachResponseTrigger: trigger,
+        aiCoachResponseError: FieldValue.delete(),
+      },
+      { merge: true }
+    );
+
+    await sessionRef.set(
+      {
+        aiCoachResponseStatus: "ready",
+        aiCoachResponseModel: OPENROUTER_COACH_MODEL,
+        aiCoachResponseUpdatedAt: FieldValue.serverTimestamp(),
+        aiCoachResponseError: FieldValue.delete(),
+      },
+      { merge: true }
+    );
+
+    console.log(`AI coach response generated for session ${sessionRef.id} (model: ${OPENROUTER_COACH_MODEL})`);
+    return { status: "ready", cached: false, model: OPENROUTER_COACH_MODEL };
+  } catch (err) {
+    console.error("AI coach response generation error:", err);
+    await markAiCoachStatus(sessionRef, reportRef, "failed", {
+      aiCoachResponseError: err.message || "failed to generate AI coach response",
+      aiCoachResponseTrigger: trigger,
+    }).catch(() => null);
+    return {
+      status: "failed",
+      error: err.message || "failed to generate AI coach response",
+    };
+  } finally {
+    aiCoachResponseJobs.delete(sessionRef.id);
+  }
+}
+
+function queueAiCoachResponseBuild(sessionRef, options = {}) {
+  const force = parseBoolean(options.force, false);
+
+  if (aiCoachResponseJobs.has(sessionRef.id) && !force) {
+    return { status: "processing", queued: true, alreadyRunning: true };
+  }
+
+  const promise = generateAiCoachResponseForSession(sessionRef, options);
+  aiCoachResponseJobs.set(sessionRef.id, promise);
+
+  promise.catch((err) => {
+    console.error("Queued AI coach response failed:", err);
+  });
+
+  return {
+    status: "processing",
+    queued: true,
+    model: OPENROUTER_COACH_MODEL,
+  };
+}
+
+app.post("/sessions/:id/reports/ai-coach-generate", authenticate, async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required" });
+    }
+
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+    if (!requireReadableSession(req, res, sessionSnap.data() || {})) return;
+
+    const force =
+      parseBoolean(req.query.force, false) ||
+      parseBoolean(req.body?.force, false);
+    const sync =
+      parseBoolean(req.query.sync, false) ||
+      parseBoolean(req.body?.sync, false);
+
+    const reportRef = sessionRef.collection("reports").doc("postSession");
+    const reportSnap = await reportRef.get();
+    if (!reportSnap.exists && isClosedSession(sessionSnap.data() || {})) {
+      await buildAndSavePostSessionReport(sessionRef, {
+        phase: "final",
+        trigger: "ai_coach_generate",
+      });
+    }
+
+    const result = sync
+      ? await generateAiCoachResponseForSession(sessionRef, { force, trigger: "manual" })
+      : queueAiCoachResponseBuild(sessionRef, { force, trigger: "manual" });
+
+    res.json({ ok: result.status !== "failed", ...result });
+  } catch (err) {
+    console.error("POST /sessions/:id/reports/ai-coach-generate error:", err);
+    res.status(500).json({ error: "failed to queue AI coach response" });
+  }
+});
 
 app.post("/sessions/:id/reports/ai-coach-beginner", authenticate, async (req, res) => {
   try {
