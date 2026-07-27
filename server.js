@@ -5168,6 +5168,119 @@ app.post("/sessions/:id/reports/ai-coach-response", async (req, res) => {
   }
 });
 
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const OPENROUTER_BEGINNER_MODEL = process.env.OPENROUTER_BEGINNER_MODEL || "anthropic/claude-opus-4.8";
+
+const BEGINNER_SYSTEM_PROMPT =
+  "You are a friendly F1 driving coach explaining session analysis to a beginner. " +
+  "The user is new to racing games and may not understand technical jargon. " +
+  "Take the advanced analysis below and rewrite it in simple, encouraging language:\n\n" +
+  "- Replace technical terms with plain English (e.g. 'trail braking' → 'gradually releasing the brake as you turn').\n" +
+  "- Keep it to 5-8 short bullet points maximum.\n" +
+  "- Focus on the 2-3 most impactful things the driver can improve.\n" +
+  "- Use an encouraging, supportive tone.\n" +
+  "- Do not add new analysis — only simplify what is already in the report.\n" +
+  "- If assists are mentioned, explain simply what they do and whether the driver should consider changing them.";
+
+app.post("/sessions/:id/reports/ai-coach-beginner", authenticate, async (req, res) => {
+  try {
+    const sessionId = safeString(req.params.id);
+
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required" });
+    }
+
+    if (!OPENROUTER_API_KEY) {
+      return res.status(503).json({ error: "AI service not configured (OPENROUTER_API_KEY missing)" });
+    }
+
+    const sessionRef = db.collection("sessions").doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ error: "session not found" });
+    }
+    if (!requireReadableSession(req, res, sessionSnap.data() || {})) return;
+
+    // Check if beginner report already exists
+    const reportRef = sessionRef.collection("reports").doc("postSession");
+    const reportSnap = await reportRef.get();
+
+    if (reportSnap.exists) {
+      const existing = reportSnap.data() || {};
+      if (existing.aiCoachBeginnerResponse) {
+        return res.json({
+          ok: true,
+          cached: true,
+          beginnerResponse: existing.aiCoachBeginnerResponse,
+        });
+      }
+    }
+
+    // Get the advanced report content to simplify
+    const advancedContent =
+      (reportSnap.exists && (reportSnap.data() || {}).aiCoachResponse) ||
+      safeString(req.body.advancedContent, null);
+
+    if (!advancedContent) {
+      return res.status(400).json({ error: "No advanced report available to simplify" });
+    }
+
+    // Call OpenRouter to generate beginner version
+    const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENROUTER_BEGINNER_MODEL,
+        messages: [
+          { role: "system", content: BEGINNER_SYSTEM_PROMPT },
+          { role: "user", content: advancedContent },
+        ],
+      }),
+    });
+
+    if (!openRouterRes.ok) {
+      const errText = await openRouterRes.text().catch(() => "");
+      console.error("OpenRouter beginner report error:", openRouterRes.status, errText.slice(0, 300));
+      return res.status(502).json({ error: "AI service returned an error" });
+    }
+
+    const aiData = await openRouterRes.json();
+    const beginnerResponse = aiData?.choices?.[0]?.message?.content;
+
+    if (!beginnerResponse) {
+      return res.status(502).json({ error: "AI service returned an empty response" });
+    }
+
+    // Save to Firestore
+    if (reportSnap.exists) {
+      await reportRef.set(
+        {
+          aiCoachBeginnerResponse: beginnerResponse,
+          aiCoachBeginnerModel: OPENROUTER_BEGINNER_MODEL,
+          aiCoachBeginnerGeneratedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } else {
+      await reportRef.set({
+        aiCoachBeginnerResponse: beginnerResponse,
+        aiCoachBeginnerModel: OPENROUTER_BEGINNER_MODEL,
+        aiCoachBeginnerGeneratedAt: FieldValue.serverTimestamp(),
+      });
+    }
+
+    console.log(`AI coach beginner report saved for session ${sessionId}`);
+    res.json({ ok: true, cached: false, beginnerResponse });
+  } catch (err) {
+    console.error("POST /sessions/:id/reports/ai-coach-beginner error:", err);
+    res.status(500).json({ error: "failed to generate beginner report" });
+  }
+});
+
 app.post("/sessions/:id/laps", async (req, res) => {
   try {
     const sessionId = safeString(req.params.id);
